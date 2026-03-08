@@ -1,0 +1,11 @@
+# Provision RTACE dashboards from mounted JSON files.
+apiVersion: 1
+
+providers:
+  - name: RTACE
+    orgId: 1
+    folder: RTACE
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards/rtace
+    editable: false
