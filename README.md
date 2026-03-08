@@ -17,7 +17,8 @@ Kafka (audit-log)
 - **Redis**: state store (replay hashes, quarantine rules).
 - **FastAPI**: control API for health and enforcement rules.
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
-- **Docker Compose**: runs Kafka, Zookeeper, Redis, and Prometheus locally.
+- **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
+- **Docker Compose**: runs Kafka, Zookeeper, Redis, Prometheus, and Grafana locally.
 
 ## Prerequisites
 
@@ -26,7 +27,7 @@ Kafka (audit-log)
 
 ## Quick Start
 
-### 1. Start infrastructure (Kafka, Redis, Prometheus)
+### 1. Start infrastructure (Kafka, Redis, Prometheus, Grafana)
 
 From the **repository root** (parent of `rtace/`):
 
@@ -117,6 +118,44 @@ Each component exposes Prometheus metrics:
    - `curl http://localhost:9093/metrics` (containment)
    - `curl http://localhost:8000/metrics` (API)
 
+## Grafana
+
+Grafana is included in the Docker Compose stack and is provisioned at startup:
+
+- **Prometheus** is configured as the default data source (no manual setup).
+- A starter dashboard **RTACE — Fraud detection pipeline** is loaded from `deployment/grafana/provisioning/dashboards/rtace/rtace-dashboard.json`.
+
+**Viewing dashboards locally**
+
+1. Start the full stack (including Grafana):
+
+   ```bash
+   docker compose -f rtace/deployment/docker-compose.yml up -d
+   ```
+
+2. Open Grafana: **http://localhost:3000**
+
+3. Log in with the default credentials:
+   - Username: `admin`
+   - Password: `admin`
+   (Change the password when prompted, or set `GF_SECURITY_ADMIN_PASSWORD` in docker-compose to avoid the prompt.)
+
+4. Go to **Dashboards** (left sidebar) → **RTACE** folder → **RTACE — Fraud detection pipeline**.
+
+5. The dashboard includes panels for:
+   - **Transactions processed (rate)** — `transactions_processed_total` by status
+   - **Replay detections (rate)** — `replay_detections_total`
+   - **Containment actions (rate)** — `containment_actions_total`
+   - **Detection pipeline latency** — p50/p99 of `detection_pipeline_latency_seconds`
+   - **Redis operation latency** — p99 of `redis_operation_latency_seconds` by operation
+
+6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
+
+**Provisioning layout**
+
+- Data source: `deployment/grafana/provisioning/datasources/datasources.yml`
+- Dashboard provider and JSON: `deployment/grafana/provisioning/dashboards/` (provider in `dashboards.yml`, dashboards in `rtace/` subfolder)
+
 ## Example commands to test
 
 - **Health and enforcement rules** (after containment has run):
@@ -164,7 +203,7 @@ rtace/
 ├── api/                 # FastAPI control API
 ├── common/              # Models, Kafka/Redis clients
 ├── configs/             # Kafka and Redis config
-├── deployment/          # docker-compose.yml, prometheus.yml
+├── deployment/          # docker-compose.yml, prometheus.yml, grafana/provisioning
 └── README.md
 ```
 
