@@ -16,7 +16,8 @@ Kafka (audit-log)
 
 - **Redis**: state store (replay hashes, quarantine rules).
 - **FastAPI**: control API for health and enforcement rules.
-- **Docker Compose**: runs Kafka, Zookeeper, and Redis locally.
+- **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
+- **Docker Compose**: runs Kafka, Zookeeper, Redis, and Prometheus locally.
 
 ## Prerequisites
 
@@ -25,7 +26,7 @@ Kafka (audit-log)
 
 ## Quick Start
 
-### 1. Start infrastructure (Kafka + Redis)
+### 1. Start infrastructure (Kafka, Redis, Prometheus)
 
 From the **repository root** (parent of `rtace/`):
 
@@ -74,6 +75,48 @@ cd rtace && PYTHONPATH=. uvicorn api.main:app --reload --host 0.0.0.0 --port 800
 
 Order: start **detection** and **containment** first, then the **simulator**. The simulator will send transactions; some are replayed on purpose (`replay_probability=0.2`), so you should see replay detections and quarantine rules in logs and Redis.
 
+## Prometheus metrics
+
+Each component exposes Prometheus metrics:
+
+| Component           | Metrics endpoint   | Port |
+|---------------------|--------------------|------|
+| Detection engine    | `http://localhost:9091/metrics` | 9091 |
+| Containment engine  | `http://localhost:9093/metrics` | 9093 |
+| Control API         | `http://localhost:8000/metrics` | 8000 |
+
+**Metrics exposed:**
+
+- `transactions_processed_total{status}` — transactions processed (status: `ok` \| `replay`)
+- `replay_detections_total{detection_type}` — replay attacks detected
+- `containment_actions_total{detection_type,action}` — containment actions executed
+- `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
+- `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
+
+**Viewing metrics locally**
+
+1. Start the full stack (including Prometheus):
+
+   ```bash
+   docker compose -f rtace/deployment/docker-compose.yml up -d
+   ```
+
+2. Start the detection engine, containment engine, API, and simulator as in **Quick Start** above.
+
+3. Open the Prometheus UI: **http://localhost:9090**
+
+4. Example queries in Prometheus:
+   - `rate(transactions_processed_total[1m])`
+   - `replay_detections_total`
+   - `rate(containment_actions_total[1m])`
+   - `histogram_quantile(0.99, rate(detection_pipeline_latency_seconds_bucket[5m]))`
+   - `redis_operation_latency_seconds_count`
+
+5. To scrape metrics directly (without Prometheus):
+   - `curl http://localhost:9091/metrics` (detection)
+   - `curl http://localhost:9093/metrics` (containment)
+   - `curl http://localhost:8000/metrics` (API)
+
 ## Example commands to test
 
 - **Health and enforcement rules** (after containment has run):
@@ -121,7 +164,7 @@ rtace/
 ├── api/                 # FastAPI control API
 ├── common/              # Models, Kafka/Redis clients
 ├── configs/             # Kafka and Redis config
-├── deployment/          # docker-compose.yml
+├── deployment/          # docker-compose.yml, prometheus.yml
 └── README.md
 ```
 

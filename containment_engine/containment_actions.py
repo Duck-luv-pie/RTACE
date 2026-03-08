@@ -3,6 +3,7 @@
 import logging
 from typing import Optional
 
+from common.metrics import observe_redis_latency
 from common.models import DetectionEvent
 from common.redis_client import create_redis_client
 from configs.redis_config import RedisConfig
@@ -25,7 +26,8 @@ def apply_containment(
 
     if detection.detection_type == "replay_attack":
         key = f"{QUARANTINE_KEY_PREFIX}{detection.user_id}"
-        redis_client.setex(key, config.quarantine_ttl_seconds, "1")
+        with observe_redis_latency("setex_quarantine"):
+            redis_client.setex(key, config.quarantine_ttl_seconds, "1")
         logger.info(
             "Quarantine set: user_id=%s key=%s ttl=%ds",
             detection.user_id,

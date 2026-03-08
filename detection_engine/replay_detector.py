@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+from common.metrics import observe_redis_latency
 from common.models import TransactionEvent, DetectionEvent
 from common.redis_client import create_redis_client
 from configs.redis_config import RedisConfig
@@ -29,9 +30,12 @@ def check_replay(
     key = f"{REDIS_KEY_PREFIX}{_date_key()}"
     tx_hash = tx.replay_hash()
 
-    added = redis_client.sadd(key, tx_hash)
+    with observe_redis_latency("replay_check"):
+        added = redis_client.sadd(key, tx_hash)
+        if added:
+            redis_client.expire(key, config.replay_ttl_hours * 3600)
+
     if added:
-        redis_client.expire(key, config.replay_ttl_hours * 3600)
         return None
 
     # Already in set → replay

@@ -4,7 +4,10 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from prometheus_client import generate_latest
 
+from common.metrics import observe_redis_latency
 from common.redis_client import create_redis_client
 from containment_engine.containment_actions import QUARANTINE_KEY_PREFIX
 
@@ -21,12 +24,22 @@ app = FastAPI(
 )
 
 
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus scrape endpoint."""
+    return Response(
+        content=generate_latest(),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness/readiness: checks Redis connectivity."""
     try:
         r = create_redis_client()
-        r.ping()
+        with observe_redis_latency("ping"):
+            r.ping()
         return {"status": "ok", "redis": "connected"}
     except Exception as e:
         logger.exception("Health check failed: %s", e)
@@ -38,7 +51,8 @@ def list_quarantine_rules() -> dict[str, Any]:
     """List current user quarantine rules from Redis (enforce:quarantine:user:*)."""
     try:
         r = create_redis_client()
-        keys = list(r.scan_iter(match=f"{QUARANTINE_KEY_PREFIX}*"))
+        with observe_redis_latency("scan_quarantine"):
+            keys = list(r.scan_iter(match=f"{QUARANTINE_KEY_PREFIX}*"))
         rules = []
         for key in keys:
             ttl = r.ttl(key)
@@ -57,5 +71,6 @@ def root() -> dict[str, str]:
         "service": "RTACE Control API",
         "docs": "/docs",
         "health": "/health",
+        "metrics": "/metrics",
         "enforcement": "/enforcement/rules",
     }
