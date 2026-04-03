@@ -8,12 +8,16 @@ from prometheus_client import start_http_server
 from common.kafka_client import create_consumer, create_producer, send_message
 from common.metrics import (
     detection_pipeline_latency_seconds,
+    fraud_burst_detections_total,
+    geo_velocity_detections_total,
     replay_detections_total,
     transactions_processed_total,
 )
 from common.models import TransactionEvent, DetectionEvent
 from common.redis_client import create_redis_client
 from configs.kafka_config import KafkaConfig
+from detection_engine.fraud_burst_detector import check_fraud_burst
+from detection_engine.geo_velocity_detector import check_geo_velocity
 from detection_engine.replay_detector import check_replay
 
 logging.basicConfig(
@@ -52,25 +56,65 @@ def run_detection_engine() -> None:
             if not raw:
                 continue
             tx = TransactionEvent.model_validate(raw)
-            detection = check_replay(tx, redis_client)
-            if detection:
-                transactions_processed_total.labels(status="replay").inc()
-                replay_detections_total.labels(detection_type=detection.detection_type).inc()
-                payload = detection.model_dump(mode="json")
+            replay_detection = check_replay(tx, redis_client)
+            geo_detection = check_geo_velocity(tx, redis_client)
+            burst_detection = check_fraud_burst(tx, redis_client)
+
+            if replay_detection:
+                replay_detections_total.labels(detection_type=replay_detection.detection_type).inc()
                 send_message(
                     producer,
                     kafka_config.detections_topic,
-                    payload,
-                    key=detection.user_id,
+                    replay_detection.model_dump(mode="json"),
+                    key=replay_detection.user_id,
                 )
                 logger.info(
                     "Replay detected: user_id=%s transaction_id=%s detection_id=%s",
-                    detection.user_id,
-                    detection.transaction_id,
-                    detection.detection_id,
+                    replay_detection.user_id,
+                    replay_detection.transaction_id,
+                    replay_detection.detection_id,
                 )
-            else:
-                transactions_processed_total.labels(status="ok").inc()
+
+            if geo_detection:
+                geo_velocity_detections_total.labels(
+                    detection_type=geo_detection.detection_type
+                ).inc()
+                send_message(
+                    producer,
+                    kafka_config.detections_topic,
+                    geo_detection.model_dump(mode="json"),
+                    key=geo_detection.user_id,
+                )
+                logger.info(
+                    "Geo velocity anomaly: user_id=%s transaction_id=%s detection_id=%s",
+                    geo_detection.user_id,
+                    geo_detection.transaction_id,
+                    geo_detection.detection_id,
+                )
+
+            if burst_detection:
+                fraud_burst_detections_total.labels(
+                    detection_type=burst_detection.detection_type
+                ).inc()
+                send_message(
+                    producer,
+                    kafka_config.detections_topic,
+                    burst_detection.model_dump(mode="json"),
+                    key=burst_detection.user_id,
+                )
+                logger.info(
+                    "Fraud burst: user_id=%s transaction_id=%s detection_id=%s",
+                    burst_detection.user_id,
+                    burst_detection.transaction_id,
+                    burst_detection.detection_id,
+                )
+
+            outcome = (
+                "detected"
+                if (replay_detection or geo_detection or burst_detection)
+                else "clean"
+            )
+            transactions_processed_total.labels(outcome=outcome).inc()
             detection_pipeline_latency_seconds.observe(time.perf_counter() - start)
         except Exception as e:
             logger.exception("Error processing message: %s", e)

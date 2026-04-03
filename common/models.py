@@ -16,9 +16,16 @@ class TransactionEvent(BaseModel):
     merchant: str
     timestamp: datetime
     location: str
+    latitude: float
+    longitude: float
 
     def replay_hash(self) -> str:
-        """Stable hash for replay detection (same payload = same hash)."""
+        """
+        Stable hash for replay detection (same payload = same hash).
+        MVP: uses location string and includes timestamp. Future: canonical field set,
+        normalized location representation, and consider excluding timestamp if replay
+        is defined as "same logical request resent".
+        """
         payload = f"{self.user_id}|{self.amount}|{self.merchant}|{self.timestamp.isoformat()}|{self.location}"
         return hashlib.sha256(payload.encode()).hexdigest()
 

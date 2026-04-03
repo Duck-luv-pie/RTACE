@@ -20,19 +20,26 @@ def apply_containment(
 ) -> None:
     """
     Apply containment action based on detection_type.
-    For replay_attack: set enforce:quarantine:user:{user_id} with TTL (e.g. 1 hour).
+    MVP: replay, geo_velocity_anomaly, and fraud_burst share quarantine (enforce:quarantine:user:{user_id}).
+    Long term: replay → block transaction + maybe quarantine; geo velocity → step-up auth
+    first, quarantine only for very high confidence.
     """
     config = redis_config or RedisConfig.from_env()
 
-    if detection.detection_type == "replay_attack":
+    if detection.detection_type in (
+        "replay_attack",
+        "geo_velocity_anomaly",
+        "fraud_burst",
+    ):
         key = f"{QUARANTINE_KEY_PREFIX}{detection.user_id}"
         with observe_redis_latency("setex_quarantine"):
             redis_client.setex(key, config.quarantine_ttl_seconds, "1")
         logger.info(
-            "Quarantine set: user_id=%s key=%s ttl=%ds",
+            "Quarantine set: user_id=%s key=%s ttl=%ds (type=%s)",
             detection.user_id,
             key,
             config.quarantine_ttl_seconds,
+            detection.detection_type,
         )
     else:
         logger.warning("Unknown detection_type=%s, no containment applied", detection.detection_type)
