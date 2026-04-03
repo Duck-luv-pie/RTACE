@@ -20,21 +20,35 @@ MERCHANTS = [
     "Amazon", "Stripe", "PayPal", "Walmart", "Target",
     "Best Buy", "Netflix", "Spotify", "Uber", "Lyft",
 ]
-LOCATIONS = [
-    "US-CA", "US-NY", "US-TX", "UK-LON", "DE-BER",
-    "FR-PAR", "JP-TYO", "AU-SYD", "US-FL", "US-WA",
-]
+# Location code -> (latitude, longitude) for geo velocity detection
+LOCATION_COORDS = {
+    "US-CA": (37.0, -122.0),
+    "US-NY": (40.7, -74.0),
+    "US-TX": (29.8, -95.4),
+    "UK-LON": (51.5, -0.1),
+    "DE-BER": (52.5, 13.4),
+    "FR-PAR": (48.9, 2.4),
+    "JP-TYO": (35.7, 139.7),
+    "AU-SYD": (-33.9, 151.2),
+    "US-FL": (25.8, -80.2),
+    "US-WA": (47.6, -122.3),
+}
+LOCATIONS = list(LOCATION_COORDS.keys())
 
 
 def generate_transaction(user_id: str) -> TransactionEvent:
     """Generate a single random transaction event."""
+    location = random.choice(LOCATIONS)
+    lat, lon = LOCATION_COORDS[location]
     return TransactionEvent(
         event_id=str(uuid.uuid4()),
         user_id=user_id,
         amount=round(random.uniform(5.0, 500.0), 2),
         merchant=random.choice(MERCHANTS),
         timestamp=datetime.now(timezone.utc),
-        location=random.choice(LOCATIONS),
+        location=location,
+        latitude=lat,
+        longitude=lon,
     )
 
 

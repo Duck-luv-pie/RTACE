@@ -10,12 +10,24 @@ from prometheus_client import Counter, Histogram, REGISTRY
 transactions_processed_total = Counter(
     "transactions_processed_total",
     "Total transactions processed by the detection engine",
-    ["status"],  # ok | replay
+    ["outcome"],  # clean | detected (any detector fired)
     registry=REGISTRY,
 )
 replay_detections_total = Counter(
     "replay_detections_total",
     "Total replay attacks detected",
+    ["detection_type"],
+    registry=REGISTRY,
+)
+geo_velocity_detections_total = Counter(
+    "geo_velocity_detections_total",
+    "Total geo velocity (impossible travel) anomalies detected",
+    ["detection_type"],
+    registry=REGISTRY,
+)
+fraud_burst_detections_total = Counter(
+    "fraud_burst_detections_total",
+    "Total fraud burst (too many transactions in rolling window) detections",
     ["detection_type"],
     registry=REGISTRY,
 )

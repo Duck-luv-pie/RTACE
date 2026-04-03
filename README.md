@@ -14,7 +14,7 @@ Containment Engine  ←  Redis (enforcement rules)  ←  Kafka (detections)
 Kafka (audit-log)
 ```
 
-- **Redis**: state store (replay hashes, quarantine rules).
+- **Redis**: state store (replay hashes, user sessions, burst windows, quarantine rules).
 - **FastAPI**: control API for health and enforcement rules.
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
@@ -88,8 +88,10 @@ Each component exposes Prometheus metrics:
 
 **Metrics exposed:**
 
-- `transactions_processed_total{status}` — transactions processed (status: `ok` \| `replay`)
+- `transactions_processed_total{outcome}` — transactions processed (outcome: `clean` \| `detected`; detected = any detector fired)
 - `replay_detections_total{detection_type}` — replay attacks detected
+- `geo_velocity_detections_total{detection_type}` — geo velocity (impossible travel) anomalies detected
+- `fraud_burst_detections_total{detection_type}` — fraud burst (too many transactions in rolling window) detections
 - `containment_actions_total{detection_type,action}` — containment actions executed
 - `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
 - `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
@@ -143,11 +145,13 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 4. Go to **Dashboards** (left sidebar) → **RTACE** folder → **RTACE — Fraud detection pipeline**.
 
 5. The dashboard includes panels for:
-   - **Transactions processed (rate)** — `transactions_processed_total` by status
+   - **Transactions processed (rate)** — `transactions_processed_total` by outcome (clean / detected)
    - **Replay detections (rate)** — `replay_detections_total`
    - **Containment actions (rate)** — `containment_actions_total`
    - **Detection pipeline latency** — p50/p99 of `detection_pipeline_latency_seconds`
    - **Redis operation latency** — p99 of `redis_operation_latency_seconds` by operation
+   - **Geo velocity detections (rate)** — `geo_velocity_detections_total`
+   - **Fraud burst detections (rate)** — `fraud_burst_detections_total`
 
 6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
 
@@ -179,6 +183,13 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
   redis-cli SMEMBERS "replay:seen:2025-03-08"
   ```
 
+- **Fraud burst sorted sets** (per user, rolling 1m window in key name):
+
+  ```bash
+  redis-cli ZRANGE "burst:user_1:1m" 0 -1 WITHSCORES
+  redis-cli TTL "burst:user_1:1m"
+  ```
+
 ## Configuration (environment)
 
 | Variable | Default | Description |
@@ -192,6 +203,10 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `REDIS_DB` | `0` | Redis DB |
 | `REDIS_REPLAY_TTL_HOURS` | `24` | TTL for replay seen set (hours) |
 | `REDIS_QUARANTINE_TTL_SECONDS` | `3600` | Quarantine rule TTL (1 hour) |
+| `REDIS_SESSION_TTL_DAYS` | `7` | User session (last location) TTL for geo velocity (days) |
+| `REDIS_BURST_WINDOW_SECONDS` | `60` | Rolling window length for fraud burst (seconds) |
+| `REDIS_BURST_THRESHOLD` | `20` | Max transactions allowed in the window; detection when count **exceeds** this (i.e. 21+ in 60s by default) |
+| `REDIS_BURST_KEY_TTL_SECONDS` | `120` | TTL on `burst:{user_id}:1m` sorted set keys (auto-expire when idle) |
 
 ## Project structure
 
@@ -207,12 +222,32 @@ rtace/
 └── README.md
 ```
 
-## Replay detection (first version)
+## Detection modules
+
+**Replay detection**
 
 - Each transaction is hashed (user, amount, merchant, timestamp, location).
 - Hashes are stored in Redis set `replay:seen:{date}` with 24h TTL.
 - If the same hash is seen again within the window → **replay_attack** detection is emitted to `detections`.
-- Containment for replay: key `enforce:quarantine:user:{user_id}` is set in Redis with TTL 1 hour.
+- Containment: key `enforce:quarantine:user:{user_id}` is set in Redis with TTL 1 hour.
+
+**Geo velocity (impossible travel)**
+
+- For each transaction, the user’s last location and timestamp are read from Redis key `session:{user_id}` (hash: `last_latitude`, `last_longitude`, `last_timestamp`).
+- Distance is computed with the Haversine formula; velocity = distance_km / time_hours.
+- If velocity > 900 km/h → **geo_velocity_anomaly** detection (severity high) is emitted.
+- Session is updated with the current transaction’s coordinates and timestamp; key TTL is 7 days.
+- Containment: same quarantine as replay (`enforce:quarantine:user:{user_id}`).
+
+**Fraud burst (rolling transaction rate)**
+
+- Per user, a Redis **sorted set** `burst:{user_id}:1m` stores recent transactions: **member** = transaction id (`event_id`), **score** = unix timestamp (seconds).
+- On each transaction: remove members with score **older than** the rolling window (default **60 seconds**), add the current transaction, **count** members in the set.
+- If the count **exceeds** the configurable threshold (default **20**, i.e. **21+** transactions in the window), emit **fraud_burst** (severity high) to `detections`.
+- The sorted set key is given a **TTL** (default **120 seconds**) so it expires automatically after inactivity.
+- Metric: `fraud_burst_detections_total{detection_type}`.
+- Grafana: **Fraud burst detections (rate)** panel on the RTACE dashboard.
+- Containment: same quarantine as other high-severity detections (`enforce:quarantine:user:{user_id}`).
 
 ## License
 
