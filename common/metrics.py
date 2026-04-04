@@ -31,6 +31,12 @@ fraud_burst_detections_total = Counter(
     ["detection_type"],
     registry=REGISTRY,
 )
+credential_stuffing_detections_total = Counter(
+    "credential_stuffing_detections_total",
+    "Total credential stuffing detections (failed login bursts)",
+    ["scope"],  # user | ip
+    registry=REGISTRY,
+)
 detection_pipeline_latency_seconds = Histogram(
     "detection_pipeline_latency_seconds",
     "Time to process a transaction through the detection pipeline",

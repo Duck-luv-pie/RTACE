@@ -31,10 +31,12 @@ def check_fraud_burst(
     cutoff = now_ts - float(config.burst_window_seconds)
 
     with observe_redis_latency("burst_window"):
-        redis_client.zremrangebyscore(key, "-inf", cutoff)
-        redis_client.zadd(key, {tx.event_id: now_ts})
-        count = redis_client.zcard(key)
-        redis_client.expire(key, config.burst_key_ttl_seconds)
+        with redis_client.pipeline(transaction=False) as pipe:
+            pipe.zremrangebyscore(key, "-inf", cutoff)
+            pipe.zadd(key, {tx.event_id: now_ts})
+            pipe.zcard(key)
+            pipe.expire(key, config.burst_key_ttl_seconds)
+            _, _, count, _ = pipe.execute()
 
     if count > config.burst_threshold:
         return DetectionEvent(

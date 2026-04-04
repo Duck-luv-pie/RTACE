@@ -47,17 +47,33 @@ def run_containment_engine() -> None:
                 continue
             detection = DetectionEvent.model_validate(raw)
             apply_containment(detection, redis_client)
-            containment_actions_total.labels(
-                detection_type=detection.detection_type,
-                action="quarantine",
-            ).inc()
+            if detection.detection_type == "credential_stuffing":
+                containment_actions_total.labels(
+                    detection_type=detection.detection_type,
+                    action="quarantine",
+                ).inc()
+                if detection.ip_address:
+                    containment_actions_total.labels(
+                        detection_type=detection.detection_type,
+                        action="ip_block",
+                    ).inc()
+            else:
+                containment_actions_total.labels(
+                    detection_type=detection.detection_type,
+                    action="quarantine",
+                ).inc()
             # Audit log: record that we took action
             audit = {
                 "detection_id": detection.detection_id,
                 "detection_type": detection.detection_type,
                 "user_id": detection.user_id,
-                "action": "quarantine",
+                "action": (
+                    "quarantine+ip_block"
+                    if detection.detection_type == "credential_stuffing" and detection.ip_address
+                    else "quarantine"
+                ),
                 "timestamp": detection.timestamp.isoformat(),
+                "ip_address": detection.ip_address,
             }
             send_message(
                 producer,
