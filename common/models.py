@@ -30,6 +30,16 @@ class TransactionEvent(BaseModel):
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
+class AuthEvent(BaseModel):
+    """Authentication / login event (separate from transaction events)."""
+
+    event_id: str
+    user_id: str
+    ip_address: str
+    success: bool
+    timestamp: datetime
+
+
 class DetectionEvent(BaseModel):
     """Detection event published to the detections topic."""
 
@@ -39,3 +49,7 @@ class DetectionEvent(BaseModel):
     user_id: str
     transaction_id: str
     timestamp: datetime
+    ip_address: Optional[str] = Field(
+        default=None,
+        description="Source IP when relevant (e.g. credential stuffing)",
+    )

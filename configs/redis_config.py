@@ -17,6 +17,11 @@ class RedisConfig:
     burst_window_seconds: int
     burst_threshold: int
     burst_key_ttl_seconds: int
+    auth_fail_window_seconds: int
+    auth_fail_user_threshold: int
+    auth_fail_ip_threshold: int
+    auth_fail_key_ttl_seconds: int
+    ip_block_ttl_seconds: int
 
     @classmethod
     def from_env(cls) -> "RedisConfig":
@@ -30,4 +35,9 @@ class RedisConfig:
             burst_window_seconds=int(os.getenv("REDIS_BURST_WINDOW_SECONDS", "60")),
             burst_threshold=int(os.getenv("REDIS_BURST_THRESHOLD", "20")),
             burst_key_ttl_seconds=int(os.getenv("REDIS_BURST_KEY_TTL_SECONDS", "120")),
+            auth_fail_window_seconds=int(os.getenv("REDIS_AUTH_FAIL_WINDOW_SECONDS", "60")),
+            auth_fail_user_threshold=int(os.getenv("REDIS_AUTH_FAIL_USER_THRESHOLD", "10")),
+            auth_fail_ip_threshold=int(os.getenv("REDIS_AUTH_FAIL_IP_THRESHOLD", "50")),
+            auth_fail_key_ttl_seconds=int(os.getenv("REDIS_AUTH_FAIL_KEY_TTL_SECONDS", "120")),
+            ip_block_ttl_seconds=int(os.getenv("REDIS_IP_BLOCK_TTL_SECONDS", "3600")),
         )

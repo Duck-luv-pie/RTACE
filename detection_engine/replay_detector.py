@@ -31,9 +31,10 @@ def check_replay(
     tx_hash = tx.replay_hash()
 
     with observe_redis_latency("replay_check"):
-        added = redis_client.sadd(key, tx_hash)
-        if added:
-            redis_client.expire(key, config.replay_ttl_hours * 3600)
+        with redis_client.pipeline(transaction=False) as pipe:
+            pipe.sadd(key, tx_hash)
+            pipe.expire(key, config.replay_ttl_hours * 3600)
+            added, _ = pipe.execute()
 
     if added:
         return None

@@ -5,7 +5,8 @@ A real-time fraud detection pipeline that ingests transaction streams, detects t
 ## Architecture
 
 ```
-Transaction Simulator  →  Kafka (tx-events)  →  Detection Engine
+Transaction Simulator  →  Kafka (tx-events)   ─┐
+                       →  Kafka (auth-events) ─┼→  Detection Engine
                                                       ↓
                                               Kafka (detections)
                                                       ↓
@@ -14,7 +15,7 @@ Containment Engine  ←  Redis (enforcement rules)  ←  Kafka (detections)
 Kafka (audit-log)
 ```
 
-- **Redis**: state store (replay hashes, user sessions, burst windows, quarantine rules).
+- **Redis**: state store (replay hashes, user sessions, burst windows, auth-fail windows, IP blocks, quarantine rules).
 - **FastAPI**: control API for health and enforcement rules.
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
@@ -35,7 +36,7 @@ From the **repository root** (parent of `rtace/`):
 docker compose -f rtace/deployment/docker-compose.yml up -d
 ```
 
-Wait until Kafka is healthy (e.g. 30–60 seconds). Topics `tx-events`, `detections`, and `audit-log` are auto-created on first use.
+Wait until Kafka is healthy (e.g. 30–60 seconds). Topics `tx-events`, `auth-events`, `detections`, and `audit-log` are auto-created on first use.
 
 ### 2. Install Python dependencies
 
@@ -62,7 +63,7 @@ cd rtace && PYTHONPATH=. python -m detection_engine.consumer
 cd rtace && PYTHONPATH=. python -m containment_engine.consumer
 ```
 
-**Terminal 3 — Transaction simulator** (produces tx-events, with optional replays):
+**Terminal 3 — Simulator** (produces **transaction** events to `tx-events` and **authentication** events to `auth-events`, with optional transaction replays and occasional failed-login bursts):
 
 ```bash
 cd rtace && PYTHONPATH=. python -m simulator.transaction_simulator
@@ -92,7 +93,8 @@ Each component exposes Prometheus metrics:
 - `replay_detections_total{detection_type}` — replay attacks detected
 - `geo_velocity_detections_total{detection_type}` — geo velocity (impossible travel) anomalies detected
 - `fraud_burst_detections_total{detection_type}` — fraud burst (too many transactions in rolling window) detections
-- `containment_actions_total{detection_type,action}` — containment actions executed
+- `credential_stuffing_detections_total{scope}` — credential stuffing (`scope`: `user` \| `ip`)
+- `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine`, `ip_block` for credential stuffing)
 - `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
 - `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
 
@@ -152,6 +154,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
    - **Redis operation latency** — p99 of `redis_operation_latency_seconds` by operation
    - **Geo velocity detections (rate)** — `geo_velocity_detections_total`
    - **Fraud burst detections (rate)** — `fraud_burst_detections_total`
+   - **Credential stuffing detections (rate, by scope)** — `credential_stuffing_detections_total` (`user` vs `ip`)
 
 6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
 
@@ -190,12 +193,27 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
   redis-cli TTL "burst:user_1:1m"
   ```
 
+- **Credential stuffing** (failed-login rolling windows; IP keys use `-` instead of `:` for IPv6 safety):
+
+  ```bash
+  redis-cli ZRANGE "auth:fail:user:user_1:1m" 0 -1 WITHSCORES
+  redis-cli ZRANGE "auth:fail:ip:198.51.100.250:1m" 0 -1 WITHSCORES
+  ```
+
+- **IP block** (after credential stuffing containment):
+
+  ```bash
+  redis-cli GET "block:ip:198.51.100.250"
+  redis-cli TTL "block:ip:198.51.100.250"
+  ```
+
 ## Configuration (environment)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka brokers |
 | `KAFKA_TX_EVENTS_TOPIC` | `tx-events` | Transaction events topic |
+| `KAFKA_AUTH_EVENTS_TOPIC` | `auth-events` | Authentication / login events topic |
 | `KAFKA_DETECTIONS_TOPIC` | `detections` | Detection events topic |
 | `KAFKA_AUDIT_LOG_TOPIC` | `audit-log` | Audit log topic |
 | `REDIS_HOST` | `localhost` | Redis host |
@@ -207,13 +225,18 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `REDIS_BURST_WINDOW_SECONDS` | `60` | Rolling window length for fraud burst (seconds) |
 | `REDIS_BURST_THRESHOLD` | `20` | Max transactions allowed in the window; detection when count **exceeds** this (i.e. 21+ in 60s by default) |
 | `REDIS_BURST_KEY_TTL_SECONDS` | `120` | TTL on `burst:{user_id}:1m` sorted set keys (auto-expire when idle) |
+| `REDIS_AUTH_FAIL_WINDOW_SECONDS` | `60` | Rolling window for failed-login tracking (credential stuffing) |
+| `REDIS_AUTH_FAIL_USER_THRESHOLD` | `10` | Per-user failed logins in window before detection; fires when count **exceeds** (11+) |
+| `REDIS_AUTH_FAIL_IP_THRESHOLD` | `50` | Per-IP failed logins in window before detection; fires when count **exceeds** (51+) |
+| `REDIS_AUTH_FAIL_KEY_TTL_SECONDS` | `120` | TTL on `auth:fail:*` sorted set keys |
+| `REDIS_IP_BLOCK_TTL_SECONDS` | `3600` | TTL on `block:ip:{ip}` after credential stuffing containment (1 hour) |
 
 ## Project structure
 
 ```
 rtace/
-├── simulator/           # Transaction event generator
-├── detection_engine/    # Replay detector, tx-events → detections
+├── simulator/           # Transaction + auth event generator (tx-events, auth-events)
+├── detection_engine/    # Detectors; consumes tx-events + auth-events → detections
 ├── containment_engine/ # Detections → Redis rules + audit-log
 ├── api/                 # FastAPI control API
 ├── common/              # Models, Kafka/Redis clients
@@ -221,6 +244,11 @@ rtace/
 ├── deployment/          # docker-compose.yml, prometheus.yml, grafana/provisioning
 └── README.md
 ```
+
+## Event types
+
+- **Transaction events** (`tx-events`): same schema as before (`user_id`, `amount`, `merchant`, `location`, `latitude` / `longitude`, etc.).
+- **Authentication events** (`auth-events`): `event_id`, `user_id`, `ip_address`, `success` (boolean), `timestamp`. Used for credential stuffing detection only (failed attempts).
 
 ## Detection modules
 
@@ -248,6 +276,17 @@ rtace/
 - Metric: `fraud_burst_detections_total{detection_type}`.
 - Grafana: **Fraud burst detections (rate)** panel on the RTACE dashboard.
 - Containment: same quarantine as other high-severity detections (`enforce:quarantine:user:{user_id}`).
+
+**Credential stuffing**
+
+- Consumes **authentication events** from `auth-events` (failed logins only; successes are ignored).
+- **Account-targeted:** Redis sorted set `auth:fail:user:{user_id}:1m` — member = `event_id`, score = unix time. Entries older than the rolling window (default **60s**) are removed. If count **exceeds** the user threshold (default **10**, i.e. **11+** fails), emit **credential_stuffing** with metric scope `user`.
+- **IP-targeted:** Redis sorted set `auth:fail:ip:{ip}:1m` (IPv6 addresses use `-` instead of `:` in the key). Same trim/append pattern. If count **exceeds** the IP threshold (default **50**, i.e. **51+**), emit **credential_stuffing** with scope `ip`.
+- Both strategies can fire on the same failed login; separate detection events are emitted (`det-cred-user-…` vs `det-cred-ip-…`).
+- Detection payload includes `user_id`, `ip_address`, `transaction_id` (auth `event_id`), `severity` high.
+- Metrics: `credential_stuffing_detections_total{scope="user|ip"}`.
+- Grafana: **Credential stuffing detections (rate, by scope)**.
+- Containment: user quarantine (`enforce:quarantine:user:{user_id}`) **and** IP block (`block:ip:{ip}`, TTL **1 hour** by default). Audit log action `quarantine+ip_block` when IP is present.
 
 ## License
 
