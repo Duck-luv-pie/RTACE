@@ -52,6 +52,14 @@ containment_actions_total = Counter(
     registry=REGISTRY,
 )
 
+# Session L1 cache
+session_cache_requests_total = Counter(
+    "session_cache_requests_total",
+    "L1 session cache lookups, by result",
+    ["result"],  # hit | miss
+    registry=REGISTRY,
+)
+
 # Redis (used by detection, containment, and API)
 redis_operation_latency_seconds = Histogram(
     "redis_operation_latency_seconds",
