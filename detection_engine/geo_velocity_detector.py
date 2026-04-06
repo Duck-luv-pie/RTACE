@@ -2,13 +2,12 @@
 
 import math
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
-from common.metrics import observe_redis_latency
+from common import session_cache
 from common.models import TransactionEvent, DetectionEvent
 from configs.redis_config import RedisConfig
 
-SESSION_KEY_PREFIX = "session:"
 MAX_VELOCITY_KMH = 900.0
 MIN_TIME_HOURS = 1.0 / 3600.0  # 1 second, avoid div by zero
 
@@ -28,47 +27,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * c
 
 
-def _session_key(user_id: str) -> str:
-    return f"{SESSION_KEY_PREFIX}{user_id}"
-
-
-def _get_session(redis_client, user_id: str) -> Optional[dict[str, Any]]:
-    """Retrieve last location and timestamp from Redis session key. Returns None if missing."""
-    key = _session_key(user_id)
-    with observe_redis_latency("session_get"):
-        raw = redis_client.hgetall(key)
-    if not raw:
-        return None
-    try:
-        return {
-            "last_latitude": float(raw["last_latitude"]),
-            "last_longitude": float(raw["last_longitude"]),
-            "last_timestamp": raw["last_timestamp"],
-        }
-    except (KeyError, ValueError, TypeError):
-        return None
-
-
-def _set_session(
-    redis_client,
-    user_id: str,
-    latitude: float,
-    longitude: float,
-    timestamp: datetime,
-    ttl_seconds: int,
-) -> None:
-    """Update Redis session with current transaction location and timestamp."""
-    key = _session_key(user_id)
-    with observe_redis_latency("session_set"):
-        redis_client.hset(
-            key,
-            mapping={
-                "last_latitude": str(latitude),
-                "last_longitude": str(longitude),
-                "last_timestamp": timestamp.isoformat(),
-            },
-        )
-        redis_client.expire(key, ttl_seconds)
 
 
 def check_geo_velocity(
@@ -84,10 +42,10 @@ def check_geo_velocity(
     config = redis_config or RedisConfig.from_env()
     ttl_seconds = config.session_ttl_days * 24 * 3600
 
-    session = _get_session(redis_client, tx.user_id)
+    session = session_cache.get_session(redis_client, tx.user_id)
 
     if session is None:
-        _set_session(
+        session_cache.set_session(
             redis_client, tx.user_id, tx.latitude, tx.longitude, tx.timestamp, ttl_seconds
         )
         return None
@@ -97,7 +55,7 @@ def check_geo_velocity(
             session["last_timestamp"].replace("Z", "+00:00")
         )
     except (ValueError, TypeError):
-        _set_session(
+        session_cache.set_session(
             redis_client, tx.user_id, tx.latitude, tx.longitude, tx.timestamp, ttl_seconds
         )
         return None
@@ -106,7 +64,7 @@ def check_geo_velocity(
     time_hours = time_delta_seconds / 3600.0
 
     if time_hours < MIN_TIME_HOURS:
-        _set_session(
+        session_cache.set_session(
             redis_client, tx.user_id, tx.latitude, tx.longitude, tx.timestamp, ttl_seconds
         )
         return None
@@ -131,7 +89,7 @@ def check_geo_velocity(
     else:
         detection = None
 
-    _set_session(
+    session_cache.set_session(
         redis_client, tx.user_id, tx.latitude, tx.longitude, tx.timestamp, ttl_seconds
     )
     return detection
