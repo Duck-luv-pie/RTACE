@@ -30,18 +30,17 @@ Kafka (audit-log)
 
 ### 1. Start infrastructure (Kafka, Redis, Prometheus, Grafana)
 
-From the **repository root** (parent of `rtace/`):
+From the repository root:
 
 ```bash
-docker compose -f rtace/deployment/docker-compose.yml up -d
+docker compose -f deployment/docker-compose.yml up -d
 ```
 
-Wait until Kafka is healthy (e.g. 30–60 seconds). Topics `tx-events`, `auth-events`, `detections`, and `audit-log` are auto-created on first use.
+Wait until Kafka is healthy (e.g. 30–60 seconds). The `kafka-init` service creates the `tx-events`, `auth-events`, `detections`, and `audit-log` topics automatically (16 partitions each, so multiple consumer processes can run in parallel).
 
 ### 2. Install Python dependencies
 
 ```bash
-cd rtace
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -49,30 +48,30 @@ pip install -r requirements.txt
 
 ### 3. Run the pipeline
 
-Use **four terminals**, all from the `rtace` directory with the venv activated.
+Use **four terminals**, all from the repository root with the venv activated.
 
 **Terminal 1 — Detection engine** (consumes tx-events, produces detections):
 
 ```bash
-cd rtace && PYTHONPATH=. python -m detection_engine.consumer
+PYTHONPATH=. python -m detection_engine.consumer
 ```
 
 **Terminal 2 — Containment engine** (consumes detections, writes Redis + audit-log):
 
 ```bash
-cd rtace && PYTHONPATH=. python -m containment_engine.consumer
+PYTHONPATH=. python -m containment_engine.consumer
 ```
 
 **Terminal 3 — Simulator** (produces **transaction** events to `tx-events` and **authentication** events to `auth-events`, with optional transaction replays and occasional failed-login bursts):
 
 ```bash
-cd rtace && PYTHONPATH=. python -m simulator.transaction_simulator
+PYTHONPATH=. python -m simulator.transaction_simulator
 ```
 
 **Terminal 4 — Control API** (optional):
 
 ```bash
-cd rtace && PYTHONPATH=. uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+PYTHONPATH=. uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Order: start **detection** and **containment** first, then the **simulator**. The simulator will send transactions; some are replayed on purpose (`replay_probability=0.2`), so you should see replay detections and quarantine rules in logs and Redis.
@@ -103,7 +102,7 @@ Each component exposes Prometheus metrics:
 1. Start the full stack (including Prometheus):
 
    ```bash
-   docker compose -f rtace/deployment/docker-compose.yml up -d
+   docker compose -f deployment/docker-compose.yml up -d
    ```
 
 2. Start the detection engine, containment engine, API, and simulator as in **Quick Start** above.
@@ -134,7 +133,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 1. Start the full stack (including Grafana):
 
    ```bash
-   docker compose -f rtace/deployment/docker-compose.yml up -d
+   docker compose -f deployment/docker-compose.yml up -d
    ```
 
 2. Open Grafana: **http://localhost:3000**
@@ -234,7 +233,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 ## Project structure
 
 ```
-rtace/
+RTACE/
 ├── simulator/           # Transaction + auth event generator (tx-events, auth-events)
 ├── detection_engine/    # Detectors; consumes tx-events + auth-events → detections
 ├── containment_engine/ # Detections → Redis rules + audit-log
@@ -290,4 +289,4 @@ rtace/
 
 ## License
 
-Internal use. Adjust as needed for your organization.
+MIT — see [LICENSE](LICENSE).
