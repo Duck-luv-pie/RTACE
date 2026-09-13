@@ -1,6 +1,7 @@
 """Detection engine: consume tx-events and auth-events, run detectors, publish detections."""
 
 import logging
+import os
 import threading
 import time
 
@@ -23,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-METRICS_PORT = 9091
+METRICS_PORT = int(os.getenv("DETECTION_METRICS_PORT", "9091"))
 STAGE = "detection"
 
 

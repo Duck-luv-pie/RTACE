@@ -1,6 +1,7 @@
 """Containment engine: consume detections, apply containment actions, write audit-log."""
 
 import logging
+import os
 import threading
 
 from prometheus_client import start_http_server
@@ -18,7 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-METRICS_PORT = 9093
+# 9094, not 9093: 9093 is the conventional KRaft controller port on a local Kafka.
+METRICS_PORT = int(os.getenv("CONTAINMENT_METRICS_PORT", "9094"))
 STAGE = "containment"
 
 

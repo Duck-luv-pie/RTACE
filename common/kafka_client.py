@@ -22,7 +22,9 @@ def create_producer(config: Optional[KafkaConfig] = None) -> KafkaProducer:
     acks="all" + enable_idempotence: a detection or audit record is only
     considered sent once the in-sync replicas have it, and broker-side
     de-duplication means a retried batch cannot produce duplicates or reorder
-    records within a partition.
+    records within a partition. kafka-python requires
+    max_in_flight_requests_per_connection=1 for idempotence (the Java client
+    allows 5); throughput still comes from linger/batching, not pipelining.
     """
     cfg = config or KafkaConfig.from_env()
     return KafkaProducer(
@@ -34,7 +36,7 @@ def create_producer(config: Optional[KafkaConfig] = None) -> KafkaProducer:
         compression_type="lz4",
         acks="all",
         enable_idempotence=True,
-        max_in_flight_requests_per_connection=5,
+        max_in_flight_requests_per_connection=1,
     )
 
 

@@ -26,14 +26,22 @@ def test_replay_quarantines_user_with_ttl(redis_client, redis_config):
     assert 0 < redis_client.ttl("enforce:quarantine:user:user_1") <= 100
 
 
-def test_credential_stuffing_quarantines_and_blocks_ip(redis_client, redis_config):
-    actions = apply_containment(_det("credential_stuffing", ip="2001:db8::7"), redis_client, redis_config)
-    assert actions == ["quarantine", "ip_block"]
+def test_ip_scope_credential_stuffing_quarantines_and_blocks_ip(redis_client, redis_config):
+    det = _det("credential_stuffing", ip="2001:db8::7", scope="ip")
+    assert apply_containment(det, redis_client, redis_config) == ["quarantine", "ip_block"]
     assert redis_client.exists("block:ip:2001-db8--7")
 
 
-def test_credential_stuffing_without_ip_only_quarantines(redis_client, redis_config):
-    assert apply_containment(_det("credential_stuffing"), redis_client, redis_config) == ["quarantine"]
+def test_user_scope_credential_stuffing_never_blocks_the_triggering_ip(redis_client, redis_config):
+    """The IP on a user-scope detection is whoever tipped the count, possibly the real user."""
+    det = _det("credential_stuffing", ip="198.51.100.10", scope="user")
+    assert apply_containment(det, redis_client, redis_config) == ["quarantine"]
+    assert redis_client.keys("block:ip:*") == []
+
+
+def test_ip_scope_without_ip_only_quarantines(redis_client, redis_config):
+    det = _det("credential_stuffing", scope="ip")
+    assert apply_containment(det, redis_client, redis_config) == ["quarantine"]
     assert redis_client.keys("block:ip:*") == []
 
 

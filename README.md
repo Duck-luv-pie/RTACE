@@ -97,6 +97,37 @@ pytest
 
 The suite runs against an in-memory Redis (`fakeredis`) and fake Kafka consumers, so it needs no infrastructure. It covers every detector, the cooldown, the session cache, the consumer loop (commit / retry / DLQ / shutdown), containment policy, enforcement, the API and the simulator.
 
+### Running without Docker (Homebrew on macOS)
+
+```bash
+brew install redis kafka                     # Kafka 4.x runs in KRaft mode out of the box
+# Match the compose settings: never evict enforcement keys; persist them
+sed -i '' -e 's/^# *maxmemory-policy .*/maxmemory-policy noeviction/' -e 's/^appendonly no$/appendonly yes/' "$(brew --prefix)/etc/redis.conf"
+echo 'auto.create.topics.enable=false' >> "$(brew --prefix)/etc/kafka/server.properties"
+brew services start redis && brew services start kafka
+for t in tx-events:16 auth-events:16 detections:16 audit-log:16 rtace-dlq:4; do
+  kafka-topics --bootstrap-server localhost:9092 --create --if-not-exists --topic "${t%%:*}" --partitions "${t##*:}" --replication-factor 1
+done
+```
+
+Then run the Python services exactly as above. Notes:
+
+- A local Kafka's KRaft controller listens on **9093**, which is why the containment engine's metrics port is 9094.
+- kafka-python first tries `localhost` over IPv6, logs one `InvalidReceiveError` at startup and reconnects over IPv4. It is harmless; set `KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092` to silence it.
+- Prometheus and Grafana are not part of this path; scrape the `/metrics` endpoints directly or `brew install prometheus grafana` and point them at the same ports.
+
+## Performance
+
+Measured on an Apple Silicon laptop with Kafka and Redis installed via Homebrew, one detection-engine process, no contention (2026-09):
+
+| Path | Redis round trips per record | Throughput per process | p50 / p99 pipeline latency |
+|------|------------------------------|------------------------|----------------------------|
+| Transaction, full detector path | 4 (enforcement, replay, session write, burst) | ~4,400 records/s | 0.5 ms / 1.0 ms |
+| Successful login or blocked event | 1 | ~19,000 records/s | |
+| Mixed backlog (50/50) | | ~7,000 records/s | |
+
+The producer side is not the bottleneck (the simulator sustained ~35,000 events/s). The engine is bound by sequential Redis round trips plus per-record Python work, so it scales linearly with processes up to the 16 partitions per topic, and a single Redis instance saturates around 25,000 full-path transactions/s. To go beyond that: pipeline Redis work across a whole poll batch, collapse the per-transaction checks into one Lua script, switch to confluent-kafka, and shard Redis.
+
 ## Prometheus metrics
 
 Each component exposes Prometheus metrics:
@@ -104,7 +135,7 @@ Each component exposes Prometheus metrics:
 | Component           | Metrics endpoint   | Port |
 |---------------------|--------------------|------|
 | Detection engine    | `http://localhost:9091/metrics` | 9091 |
-| Containment engine  | `http://localhost:9093/metrics` | 9093 |
+| Containment engine  | `http://localhost:9094/metrics` | 9094 |
 | Control API         | `http://localhost:8000/metrics` | 8000 |
 
 **Metrics exposed:**
@@ -147,7 +178,7 @@ Each component exposes Prometheus metrics:
 
 5. To scrape metrics directly (without Prometheus):
    - `curl http://localhost:9091/metrics` (detection)
-   - `curl http://localhost:9093/metrics` (containment)
+   - `curl http://localhost:9094/metrics` (containment)
    - `curl http://localhost:8000/metrics` (API)
 
 ## Grafana
@@ -268,6 +299,8 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `KAFKA_FETCH_MAX_WAIT_MS` | `100` | Max broker wait when `KAFKA_FETCH_MIN_BYTES` is not yet satisfied |
 | `KAFKA_MAX_POLL_RECORDS` | `500` | Records per poll |
 | `KAFKA_POLL_TIMEOUT_MS` | `1000` | Poll timeout; also the shutdown-check interval |
+| `DETECTION_METRICS_PORT` | `9091` | Prometheus port of the detection engine |
+| `CONTAINMENT_METRICS_PORT` | `9094` | Prometheus port of the containment engine (not 9093, the KRaft controller port) |
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_DB` | `0` | Redis DB |
@@ -324,7 +357,8 @@ Each key's value is the detection id (or `api:<reason>` for manual overrides), s
 |-----------|----------------|--------|
 | `replay_attack` | hard: an exact request was resent | quarantine user |
 | `fraud_burst` | hard: rate far above normal | quarantine user |
-| `credential_stuffing` | hard | quarantine user **and** block IP |
+| `credential_stuffing` (IP scope) | hard: one IP hammering many accounts | quarantine user **and** block IP |
+| `credential_stuffing` (user scope) | hard for the account, but the IP on the detection is only whichever login tipped the count, possibly the real user | quarantine user only |
 | `geo_velocity_anomaly` | soft: VPNs, shared accounts and coarse geolocation trip it | **step-up auth** for `REDIS_STEP_UP_TTL_SECONDS`; if another anomaly arrives while a step-up is already pending, **escalate to quarantine** |
 
 Every action is idempotent (SETEX), so redelivered detections are harmless.
@@ -402,7 +436,7 @@ Knobs, as environment variables or flags (flags win): `SIM_INTERVAL_SECONDS` / `
 - Detection payload includes `user_id`, `ip_address`, `transaction_id` (auth `event_id`), `severity` high.
 - Metrics: `credential_stuffing_detections_total{scope="user|ip"}`.
 - Grafana: **Credential stuffing detections (rate, by scope)**.
-- Containment: user quarantine (`enforce:quarantine:user:{user_id}`) **and** IP block (`block:ip:{ip}`, TTL **1 hour** by default). Audit log action `quarantine+ip_block` when IP is present.
+- Containment: user quarantine (`enforce:quarantine:user:{user_id}`) for both scopes; IP block (`block:ip:{ip}`, TTL **1 hour** by default) for the **IP scope only**. Audit log action is `quarantine+ip_block` or `quarantine`.
 
 **Detection cooldown**
 

@@ -4,7 +4,11 @@ Policy (see README "Containment policy"):
 
   replay_attack          -> quarantine user           (hard signal: exact request resent)
   fraud_burst            -> quarantine user           (hard signal: rate far above normal)
-  credential_stuffing    -> quarantine user + block IP
+  credential_stuffing    -> quarantine user; block the IP only for IP-scope detections.
+                            A user-scope detection carries the IP of whichever login
+                            tipped the count, which may be the legitimate user; blocking
+                            it would be a self-inflicted outage (seen in a live run, where
+                            shared office IPs got blocked).
   geo_velocity_anomaly   -> step-up authentication    (soft signal: VPNs, shared accounts,
                                                        coarse geolocation trip it often)
                             escalates to quarantine if another anomaly arrives while a
@@ -72,10 +76,11 @@ def apply_containment(
 
     elif dtype == "credential_stuffing":
         actions.append(_quarantine(redis_client, detection, config))
-        if detection.ip_address:
+        scope = detection.details.get("scope", "user")
+        if scope == "ip" and detection.ip_address:
             actions.append(_ip_block(redis_client, detection, config))
-        else:
-            logger.warning("credential_stuffing detection missing ip_address; IP block skipped")
+        elif scope == "ip":
+            logger.warning("ip-scope credential_stuffing detection missing ip_address; IP block skipped")
 
     elif dtype == "geo_velocity_anomaly":
         escalate = is_step_up_pending(redis_client, detection.user_id)

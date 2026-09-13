@@ -156,7 +156,7 @@ services:
     command: ["python", "-m", "containment_engine.consumer"]
     environment: *app-env
     ports:
-      - "9093:9093"
+      - "9094:9094"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
