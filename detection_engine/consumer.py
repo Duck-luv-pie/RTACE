@@ -1,12 +1,14 @@
 """Detection engine: consume tx-events and auth-events, run detectors, publish detections."""
 
 import logging
+import threading
 import time
 
 from kafka import ConsumerRebalanceListener
 from prometheus_client import start_http_server
 
 from common import session_cache
+from common.consumer_loop import LoopSettings, install_signal_handlers, run_consumer_loop
 from common.kafka_client import create_consumer, create_producer, send_message
 from common.metrics import detection_pipeline_latency_seconds
 from common.models import DetectionEvent
@@ -22,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 METRICS_PORT = 9091
+STAGE = "detection"
 
 
 class _SessionCacheInvalidator(ConsumerRebalanceListener):
@@ -70,27 +73,31 @@ def run_detection_engine() -> None:
 
     pipeline = DetectionPipeline(redis_client, emit, kafka_config, redis_config)
 
-    logger.info(
-        "Detection engine started: consume %s + %s → %s",
-        kafka_config.tx_events_topic,
-        kafka_config.auth_events_topic,
-        kafka_config.detections_topic,
-    )
-
-    for message in consumer:
+    def handle(topic: str, partition: int, offset: int, value) -> None:
         start = time.perf_counter()
         try:
-            if message.value:
-                pipeline.handle_record(
-                    message.topic, message.partition, message.offset, message.value
-                )
-        except Exception as e:
-            logger.exception("Error processing message: %s", e)
+            pipeline.handle_record(topic, partition, offset, value)
         finally:
             detection_pipeline_latency_seconds.observe(time.perf_counter() - start)
 
-    consumer.close()
-    producer.close()
+    shutdown = threading.Event()
+    install_signal_handlers(shutdown)
+
+    logger.info(
+        "Detection engine started: consume %s + %s → %s (DLQ %s)",
+        kafka_config.tx_events_topic,
+        kafka_config.auth_events_topic,
+        kafka_config.detections_topic,
+        kafka_config.dlq_topic,
+    )
+    run_consumer_loop(
+        consumer,
+        handle,
+        LoopSettings(stage=STAGE, poll_timeout_ms=kafka_config.poll_timeout_ms),
+        shutdown,
+        producer=producer,
+        dlq_topic=kafka_config.dlq_topic,
+    )
 
 
 if __name__ == "__main__":

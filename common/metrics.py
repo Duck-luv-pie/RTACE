@@ -63,6 +63,32 @@ containment_actions_total = Counter(
     registry=REGISTRY,
 )
 
+# Consumer loop (detection + containment)
+consumer_records_total = Counter(
+    "consumer_records_total",
+    "Kafka records handled by a consumer loop, by outcome",
+    ["stage", "result"],  # result: processed | dlq | skipped
+    registry=REGISTRY,
+)
+processing_errors_total = Counter(
+    "processing_errors_total",
+    "Handler failures, by kind (transient = retried in place, permanent = dead-lettered)",
+    ["stage", "kind"],
+    registry=REGISTRY,
+)
+dlq_messages_total = Counter(
+    "dlq_messages_total",
+    "Records written to the dead-letter topic",
+    ["stage"],
+    registry=REGISTRY,
+)
+kafka_send_failures_total = Counter(
+    "kafka_send_failures_total",
+    "Asynchronous producer sends that failed after retries",
+    ["topic"],
+    registry=REGISTRY,
+)
+
 # Session L1 cache
 session_cache_requests_total = Counter(
     "session_cache_requests_total",

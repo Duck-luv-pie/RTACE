@@ -36,7 +36,7 @@ From the repository root:
 docker compose -f deployment/docker-compose.yml up -d
 ```
 
-Wait until Kafka is healthy (e.g. 30–60 seconds). The `kafka-init` service creates the `tx-events`, `auth-events`, `detections`, and `audit-log` topics automatically (16 partitions each, so multiple consumer processes can run in parallel).
+Wait until Kafka is healthy (e.g. 30–60 seconds). The `kafka-init` service creates the `tx-events`, `auth-events`, `detections`, and `audit-log` topics automatically (16 partitions each, so multiple consumer processes can run in parallel), plus the `rtace-dlq` dead-letter topic.
 
 ### 2. Install Python dependencies
 
@@ -96,6 +96,10 @@ Each component exposes Prometheus metrics:
 - `detections_suppressed_total{detection_type}` — detections dropped by the per-subject cooldown (see **Detection cooldown**)
 - `replay_redeliveries_total` — transactions whose replay key was written by the *same* Kafka record (at-least-once redelivery, not a replay)
 - `session_cache_requests_total{result}` — L1 session cache lookups (`hit` \| `miss`)
+- `consumer_records_total{stage,result}` — records handled by each consumer loop (`processed` \| `dlq` \| `skipped`)
+- `processing_errors_total{stage,kind}` — handler failures (`transient` = retried in place, `permanent` = dead-lettered)
+- `dlq_messages_total{stage}` — records written to `rtace-dlq`
+- `kafka_send_failures_total{topic}` — async producer sends that failed after retries
 - `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine`, `ip_block` for credential stuffing)
 - `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
 - `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
@@ -225,6 +229,11 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `KAFKA_AUTH_EVENTS_TOPIC` | `auth-events` | Authentication / login events topic |
 | `KAFKA_DETECTIONS_TOPIC` | `detections` | Detection events topic |
 | `KAFKA_AUDIT_LOG_TOPIC` | `audit-log` | Audit log topic |
+| `KAFKA_DLQ_TOPIC` | `rtace-dlq` | Dead-letter topic for records that cannot be processed |
+| `KAFKA_FETCH_MIN_BYTES` | `1` | Return a fetch as soon as any data is available (lowest latency). Raise with `KAFKA_FETCH_MAX_WAIT_MS` to batch harder under load |
+| `KAFKA_FETCH_MAX_WAIT_MS` | `100` | Max broker wait when `KAFKA_FETCH_MIN_BYTES` is not yet satisfied |
+| `KAFKA_MAX_POLL_RECORDS` | `500` | Records per poll |
+| `KAFKA_POLL_TIMEOUT_MS` | `1000` | Poll timeout; also the shutdown-check interval |
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_DB` | `0` | Redis DB |
@@ -253,11 +262,26 @@ RTACE/
 ├── tests/               # pytest suite (fakeredis-backed, no Kafka needed)
 ├── containment_engine/ # Detections → Redis rules + audit-log
 ├── api/                 # FastAPI control API
-├── common/              # Models, Kafka/Redis clients
+├── common/              # Models, Kafka/Redis clients, shared consumer loop, metrics
 ├── configs/             # Kafka and Redis config
 ├── deployment/          # docker-compose.yml, prometheus.yml, grafana/provisioning
 └── README.md
 ```
+
+## Delivery guarantees and failure handling
+
+Both consumers share one loop (`common/consumer_loop.py`) with these rules:
+
+- **At-least-once, commit after processing.** Auto-commit is off. Offsets are committed synchronously after each poll batch, and only for records that were processed or deliberately dead-lettered. Every detector and containment action tolerates redelivery (replay detection recognises the same Kafka record; sorted-set members are event ids; enforcement writes are SETEX).
+- **Transient failures block, they do not skip.** If Redis is unreachable, timing out, loading, out of memory or read-only, the failing record is retried in place with exponential backoff (0.5s → 30s) and its offset is not committed. Detections are not lost while a dependency is down; the pipeline visibly stalls and `processing_errors_total{kind="transient"}` climbs.
+- **Poison records go to the DLQ.** Undecodable JSON, schema validation failures and unexpected exceptions inside a handler are written to `rtace-dlq` with the source topic/partition/offset, the base64 raw payload and the error, then committed past so one bad record cannot wedge a partition. Inspect with:
+
+  ```bash
+  kafka-console-consumer --bootstrap-server localhost:9092 --topic rtace-dlq --from-beginning
+  ```
+
+- **Graceful shutdown.** SIGINT/SIGTERM finish the current batch (or abandon a record mid-retry without committing it), commit, flush the producer and close both clients.
+- **Producer durability.** Producers use `acks=all` with the idempotent producer, so a retried batch cannot duplicate or reorder records within a partition, and send failures are counted in `kafka_send_failures_total`.
 
 ## Event types
 

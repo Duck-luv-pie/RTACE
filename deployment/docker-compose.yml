@@ -61,6 +61,7 @@ services:
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic auth-events  --partitions 16 --replication-factor 1 &&
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic detections   --partitions 16 --replication-factor 1 &&
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic audit-log    --partitions 16 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic rtace-dlq    --partitions 4  --replication-factor 1 &&
       echo 'All topics created.'
       "
     restart: "no"

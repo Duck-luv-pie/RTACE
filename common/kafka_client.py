@@ -7,24 +7,22 @@ from typing import Any, Optional, Union
 from kafka import ConsumerRebalanceListener, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
+from common.metrics import kafka_send_failures_total
 from configs.kafka_config import KafkaConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _on_send_error(exc: Exception) -> None:
-    logger.error("Async Kafka send failed: %s", exc)
-
-
 def create_producer(config: Optional[KafkaConfig] = None) -> KafkaProducer:
-    """Create a Kafka producer with JSON serialization and throughput-optimised defaults.
+    """Create a Kafka producer with JSON serialization and safe, batched defaults.
 
     linger_ms / batch_size: accumulate messages for up to 5 ms so the broker
-    receives large batches instead of one frame per message.
-    compression_type: lz4 is fast enough that it doesn't add CPU latency but
-    halves network + broker I/O at high rates.
-    acks=1: leader-ack only; sufficient for a fraud detection pipeline where
-    replay-detection handles duplicates anyway.
+    receives batches instead of one frame per message.
+    compression_type: lz4 halves network + broker I/O at high rates.
+    acks="all" + enable_idempotence: a detection or audit record is only
+    considered sent once the in-sync replicas have it, and broker-side
+    de-duplication means a retried batch cannot produce duplicates or reorder
+    records within a partition.
     """
     cfg = config or KafkaConfig.from_env()
     return KafkaProducer(
@@ -34,8 +32,8 @@ def create_producer(config: Optional[KafkaConfig] = None) -> KafkaProducer:
         linger_ms=5,
         batch_size=65_536,
         compression_type="lz4",
-        acks=1,
-        retries=3,
+        acks="all",
+        enable_idempotence=True,
         max_in_flight_requests_per_connection=5,
     )
 
@@ -48,14 +46,14 @@ def create_consumer(
 ) -> KafkaConsumer:
     """Create a Kafka consumer for one or more topics.
 
+    Offsets are committed manually by the consumer loop *after* a record has
+    been processed (see common.consumer_loop), never by a timer. Values are
+    returned as raw bytes: decoding happens in the loop so that an undecodable
+    record can be dead-lettered instead of raising inside poll() and wedging
+    the partition.
+
     rebalance_listener: optional ConsumerRebalanceListener notified when this
     process gains or loses partitions (used to drop per-process caches).
-
-    max_poll_records: pull up to 500 messages per poll instead of the default
-    500 (already the default in newer kafka-python, explicit here for clarity).
-    fetch_min_bytes / fetch_max_wait_ms: don't return a fetch response until
-    there is at least 64 KB of data available, or 100 ms have elapsed.  This
-    dramatically reduces the number of empty-poll round trips at high load.
     """
     cfg = config or KafkaConfig.from_env()
     topics = [topic] if isinstance(topic, str) else topic
@@ -63,14 +61,24 @@ def create_consumer(
         bootstrap_servers=cfg.bootstrap_servers,
         group_id=group_id,
         auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")) if m else None,
-        max_poll_records=500,
-        fetch_min_bytes=65_536,
-        fetch_max_wait_ms=100,
+        enable_auto_commit=False,
+        value_deserializer=None,
+        max_poll_records=cfg.max_poll_records,
+        fetch_min_bytes=cfg.fetch_min_bytes,
+        fetch_max_wait_ms=cfg.fetch_max_wait_ms,
     )
     consumer.subscribe(topics, listener=rebalance_listener)
     return consumer
+
+
+def decode_json(raw: Optional[bytes]) -> Any:
+    """Decode a record value. Raises ValueError on malformed input; returns None for a tombstone."""
+    if raw is None or raw == b"":
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"undecodable record value: {e}") from e
 
 
 def send_message(
@@ -81,12 +89,18 @@ def send_message(
 ) -> None:
     """Enqueue a message for async delivery.
 
-    The producer batches and sends in a background I/O thread; we never block
-    the consumer loop waiting for a broker ack.  Errors are surfaced via the
-    _on_send_error callback so they appear in logs without stalling throughput.
-    Call producer.flush() on graceful shutdown to drain the internal buffer.
+    The producer batches and sends in a background I/O thread; the consumer
+    loop never blocks waiting for a broker ack. Failures are counted in
+    kafka_send_failures_total{topic} and logged. Call producer.flush() on
+    shutdown to drain the buffer.
     """
+
+    def _on_error(exc: Exception) -> None:
+        kafka_send_failures_total.labels(topic=topic).inc()
+        logger.error("Async Kafka send to %s failed: %s", topic, exc)
+
     try:
-        producer.send(topic, value=value, key=key).add_errback(_on_send_error)
+        producer.send(topic, value=value, key=key).add_errback(_on_error)
     except KafkaError as e:
+        kafka_send_failures_total.labels(topic=topic).inc()
         logger.error("Failed to enqueue message to %s: %s", topic, e)
