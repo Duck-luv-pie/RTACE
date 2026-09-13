@@ -89,20 +89,46 @@ def send_message(
     value: dict[str, Any],
     key: Optional[str] = None,
 ) -> None:
-    """Enqueue a message for async delivery.
+    """Enqueue a message for async, batched delivery.
 
-    The producer batches and sends in a background I/O thread; the consumer
-    loop never blocks waiting for a broker ack. Failures are counted in
-    kafka_send_failures_total{topic} and logged. Call producer.flush() on
-    shutdown to drain the buffer.
+    The producer batches and sends in a background I/O thread, so the consumer
+    loop stays fast. Durability comes from calling ``flush_and_verify`` before
+    committing input offsets: a send that fails is recorded on the producer
+    (``_rtace_last_error``) and surfaced there, so the batch is retried instead
+    of committed. Failures are also counted in ``kafka_send_failures_total``.
     """
 
     def _on_error(exc: Exception) -> None:
         kafka_send_failures_total.labels(topic=topic).inc()
+        # Latch the error so flush_and_verify can refuse to commit the batch.
+        producer._rtace_last_error = exc  # type: ignore[attr-defined]
         logger.error("Async Kafka send to %s failed: %s", topic, exc)
 
     try:
         producer.send(topic, value=value, key=key).add_errback(_on_error)
     except KafkaError as e:
         kafka_send_failures_total.labels(topic=topic).inc()
+        producer._rtace_last_error = e  # type: ignore[attr-defined]
         logger.error("Failed to enqueue message to %s: %s", topic, e)
+
+
+def reset_send_errors(producer: KafkaProducer) -> None:
+    """Clear any latched send error before a fresh batch of sends."""
+    producer._rtace_last_error = None  # type: ignore[attr-defined]
+
+
+def flush_and_verify(producer: KafkaProducer, timeout: Optional[float] = None) -> None:
+    """Block until every buffered send is acknowledged, then raise if any failed.
+
+    flush() waits for all in-flight futures (and therefore their error
+    callbacks) to complete, so after it returns ``_rtace_last_error`` reflects
+    the whole batch. Raising here lets the consumer loop retry the batch rather
+    than commit input offsets for detections that were never durably delivered
+    (end-to-end at-least-once). Retries may duplicate; every downstream write is
+    idempotent (SETEX enforcement, event-id sorted-set members, stable keys).
+    """
+    producer.flush(timeout=timeout)
+    err = getattr(producer, "_rtace_last_error", None)
+    if err is not None:
+        producer._rtace_last_error = None  # type: ignore[attr-defined]
+        raise KafkaError(f"one or more sends in this batch failed: {err}")

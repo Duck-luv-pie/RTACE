@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import redis.exceptions as redis_exc
+from kafka.errors import KafkaError
 from kafka.structs import TopicPartition
 
 from common.consumer_loop import LoopSettings, per_record, run_consumer_loop
+from common.kafka_client import send_message
 from common.models import DetectionEvent
 
 
@@ -63,6 +65,35 @@ class FakeProducer:
 
     def close(self):
         self.closed = True
+
+
+class FailingProducer(FakeProducer):
+    """Mimics the real producer's errback contract: the first ``fail_attempts``
+    flushes worth of sends report a delivery failure (latched on the producer,
+    as common.kafka_client.send_message does), then sends succeed."""
+
+    def __init__(self, fail_attempts=1):
+        super().__init__()
+        self.fail_attempts = fail_attempts
+        self.flushes = 0
+
+    def send(self, topic, value=None, key=None):
+        self.sent.append((topic, value, key))
+        outer = self
+
+        class _F:
+            def add_errback(self, cb):
+                if outer.fail_attempts > 0:
+                    cb(KafkaError("broker unavailable"))  # sets producer._rtace_last_error
+                return self
+
+        return _F()
+
+    def flush(self, timeout=None):
+        self.flushed = True
+        self.flushes += 1
+        if self.fail_attempts > 0:
+            self.fail_attempts -= 1
 
 
 def _batch(topic, partition, values, start=0):
@@ -195,3 +226,56 @@ def test_producer_is_flushed_and_closed_on_exit():
     producer = FakeProducer()
     _run([], lambda *a: None, producer)
     assert producer.flushed and producer.closed
+
+
+def _emit_handler(producer, topic="detections"):
+    """A batch handler that produces one downstream message per record."""
+
+    def handler(records):
+        for _t, _p, _o, value in records:
+            send_message(producer, topic, {"echo": value})
+        return {}
+
+    return handler
+
+
+def test_failed_detection_send_blocks_commit_until_redelivered():
+    """The offset must not be committed while a detection this batch produced is
+    not yet acknowledged by the broker; the batch retries and only commits once
+    delivery succeeds."""
+    producer = FailingProducer(fail_attempts=1)
+    consumer, slept = _run([_batch("t", 0, [{"a": 1}])], None, producer, batch_handler=_emit_handler(producer))
+    assert consumer.commits == [{TopicPartition("t", 0): 1}]  # committed exactly once, after success
+    assert producer.flushes >= 2  # first flush failed, a later one succeeded (plus the exit flush)
+    assert slept == [0.01]        # exactly one backoff between the two attempts
+
+
+def test_successful_batch_flushes_before_committing():
+    """Ordering guarantee: every batch is flushed (delivery confirmed) before commit."""
+    producer = FakeProducer()
+    consumer, _ = _run([_batch("t", 0, [{"a": 1}, {"a": 2}])], None, producer, batch_handler=_emit_handler(producer))
+    assert producer.flushed is True
+    assert consumer.commits == [{TopicPartition("t", 0): 2}]
+    assert len(producer.sent) == 2  # both detections produced
+
+
+def test_persistent_send_failure_never_commits():
+    """If delivery keeps failing, the offset is never committed (no data loss);
+    the batch keeps retrying until shutdown."""
+    producer = FailingProducer(fail_attempts=10_000)
+    shutdown = threading.Event()
+    consumer = FakeConsumer([_batch("t", 0, [{"a": 1}])], shutdown)
+    attempts = {"n": 0}
+
+    def handler(records):
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            shutdown.set()  # give up after a few tries, like an operator stopping the worker
+        for _t, _p, _o, value in records:
+            send_message(producer, "detections", {"echo": value})
+        return {}
+
+    run_consumer_loop(consumer, handler, LoopSettings(stage="test", retry_initial_seconds=0.001),
+                      shutdown, producer=producer, dlq_topic="dlq", sleep=lambda s: None)
+    assert consumer.commits == []  # never committed a batch whose detections were lost
+    assert attempts["n"] >= 3
