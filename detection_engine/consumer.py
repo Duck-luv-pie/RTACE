@@ -5,10 +5,11 @@ import os
 import threading
 import time
 
+from kafka.errors import KafkaError
 from prometheus_client import start_http_server
 
 from common.consumer_loop import LoopSettings, install_signal_handlers, run_consumer_loop
-from common.kafka_client import create_consumer, create_producer, send_message
+from common.kafka_client import create_consumer, create_producer, flush_and_verify, send_message
 from common.metrics import detection_pipeline_latency_seconds
 from common.models import DetectionEvent
 from common.redis_client import create_redis_client
@@ -53,7 +54,17 @@ def run_detection_engine() -> None:
     def handle_batch(records):
         start = time.perf_counter()
         try:
-            return pipeline.handle_batch(records).failures
+            result = pipeline.handle_batch(records)
+            # Durability gate for cooled-down detections: a detection is emitted
+            # AND its cooldown claimed in the same batch. Confirm delivery before
+            # keeping the cooldown; if delivery fails, release the cooldown so the
+            # retried batch re-emits the detection instead of suppressing it.
+            try:
+                flush_and_verify(producer)
+            except KafkaError:
+                pipeline.release_cooldown(result.claimed_cooldown_keys)
+                raise  # transient: run_consumer_loop retries the batch, does not commit
+            return result.failures
         finally:
             # Per-record latency: batch wall time spread over the records in it.
             elapsed = time.perf_counter() - start

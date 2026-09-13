@@ -32,7 +32,7 @@ from common.metrics import (
     replay_detections_total,
     transactions_processed_total,
 )
-from common.models import AuthEvent, DetectionEvent, TransactionEvent, new_detection_id
+from common.models import AuthEvent, DetectionEvent, TransactionEvent, stable_detection_id
 from configs.kafka_config import KafkaConfig
 from configs.redis_config import RedisConfig
 from detection_engine import (
@@ -41,7 +41,7 @@ from detection_engine import (
     geo_velocity_detector,
     replay_detector,
 )
-from detection_engine.cooldown import filter_cooled_down
+from detection_engine.cooldown import filter_cooled_down, release_cooldown
 from detection_engine.scripts import (
     TX_BURST_COUNT,
     TX_REPLAY_STATUS,
@@ -81,6 +81,27 @@ class _Item:
 class BatchResult:
     emitted: list[DetectionEvent]
     failures: dict[int, Exception]  # record index -> permanent error
+    claimed_cooldown_keys: list[str] = field(default_factory=list)
+
+
+# Detector type -> id prefix (scope appended for credential stuffing).
+_ID_PREFIX = {
+    "replay_attack": "replay",
+    "geo_velocity_anomaly": "geo",
+    "fraud_burst": "burst",
+    "credential_stuffing": "cred",
+}
+
+
+def _assign_stable_id(detection: DetectionEvent, ref: str) -> None:
+    """Give the detection a deterministic id for this (delivery, detector, scope),
+    so a redelivery or a reprocessed batch produces the same id and containment
+    applies it exactly once."""
+    scope = detection.details.get("scope", "")
+    prefix = _ID_PREFIX.get(detection.detection_type, "det")
+    if detection.detection_type == "credential_stuffing" and scope:
+        prefix = f"{prefix}-{scope}"
+    detection.detection_id = stable_detection_id(prefix, ref, detection.detection_type, scope)
 
 
 class DetectionPipeline:
@@ -114,7 +135,7 @@ class DetectionPipeline:
         return self._run([_Item(0, tx, ref or f"direct:{uuid.uuid4()}")]).emitted
 
     def handle_auth(self, auth: AuthEvent) -> list[DetectionEvent]:
-        return self._run([_Item(0, auth, "")]).emitted
+        return self._run([_Item(0, auth, f"direct-auth:{auth.event_id}")]).emitted
 
     def handle_batch(self, records: list[Record]) -> BatchResult:
         detection_batch_size.observe(len(records))
@@ -123,7 +144,7 @@ class DetectionPipeline:
         for i, (topic, partition, offset, value) in enumerate(records):
             try:
                 if topic == self.kafka_config.auth_events_topic:
-                    items.append(_Item(i, AuthEvent.model_validate(value), ""))
+                    items.append(_Item(i, AuthEvent.model_validate(value), record_ref(topic, partition, offset)))
                 else:
                     items.append(_Item(i, TransactionEvent.model_validate(value), record_ref(topic, partition, offset)))
             except ValidationError as e:
@@ -196,18 +217,30 @@ class DetectionPipeline:
                 it.candidates.extend(self._detections_from_decision(it.event, raw))
                 transactions_processed_total.labels(outcome="prescored").inc()
 
+        # Stable ids: derive from the delivery ref so a redelivery or a retried
+        # batch reproduces the same id and containment applies it exactly once.
+        for it in items:
+            for d in it.candidates:
+                _assign_stable_id(d, it.ref)
+
         # D. cooldown + emit ---------------------------------------------------
         candidates = [d for it in items for d in it.candidates]
         for d in candidates:
             self._count(d)
-        emitted = filter_cooled_down(candidates, self.redis, cfg)
+        emitted, claimed = filter_cooled_down(candidates, self.redis, cfg)
         for d in emitted:
             self.emit(d)
             logger.info(
                 "%s: user_id=%s transaction_id=%s detection_id=%s details=%s",
                 d.detection_type, d.user_id, d.transaction_id, d.detection_id, d.details,
             )
-        return BatchResult(emitted, {})
+        return BatchResult(emitted, {}, claimed)
+
+    def release_cooldown(self, keys: list[str]) -> None:
+        """Undo cooldown reservations for a batch whose detections were not
+        delivered, so the retry can re-emit them (see the durability gate in
+        common.consumer_loop)."""
+        release_cooldown(keys, self.redis)
 
     # ------------------------------------------------------------ helpers
 
@@ -250,7 +283,8 @@ class DetectionPipeline:
             if dtype not in ("replay_attack", "geo_velocity_anomaly", "fraud_burst"):
                 continue
             out.append(DetectionEvent(
-                detection_id=new_detection_id(dtype.split("_")[0]),
+                # Placeholder; _run reassigns a stable id from the delivery ref.
+                detection_id="pending",
                 detection_type=dtype,
                 severity="high",
                 user_id=tx.user_id,

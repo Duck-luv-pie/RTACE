@@ -60,8 +60,8 @@ def test_geo_anomaly_requires_step_up_not_quarantine(redis_client, redis_config)
 
 
 def test_second_geo_anomaly_while_step_up_pending_escalates(redis_client, redis_config):
-    apply_containment(_det("geo_velocity_anomaly"), redis_client, redis_config)
-    actions = apply_containment(_det("geo_velocity_anomaly"), redis_client, redis_config)
+    apply_containment(_det("geo_velocity_anomaly", det_id="geo-a"), redis_client, redis_config)
+    actions = apply_containment(_det("geo_velocity_anomaly", det_id="geo-b"), redis_client, redis_config)
     assert actions == ["step_up_auth", "quarantine"]
     assert redis_client.exists(quarantine_key("user_1"))
 

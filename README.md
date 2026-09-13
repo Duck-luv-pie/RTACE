@@ -423,12 +423,13 @@ Each key's value is the detection id (or `api:<reason>` for manual overrides), s
 | `credential_stuffing` (user scope) | hard for the account, but the IP on the detection is only whichever login tipped the count, possibly the real user | quarantine user only |
 | `geo_velocity_anomaly` | soft: VPNs, shared accounts and coarse geolocation trip it | **step-up auth** for `REDIS_STEP_UP_TTL_SECONDS`; if another anomaly arrives while a step-up is already pending, **escalate to quarantine** |
 
-Every action is idempotent (SETEX), so redelivered detections are harmless.
+Containment is applied **exactly once per detection**. Each detection carries an id that is stable across redelivery (derived from the Kafka delivery, not random), and `apply_containment` records a receipt (`containment:applied:{detection_id}`) together with the rule writes in one `WATCH`/`MULTI`/`EXEC` transaction. A redelivered detection finds its receipt and returns the original actions without touching a rule, so redelivery cannot extend a quarantine's TTL or turn a single geo anomaly into an escalation; the `WATCH` on the step-up key also makes the escalation decision safe against two concurrent geo detections for one user.
 
 ## Delivery guarantees and failure handling
 
 Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 
+- **Cooldown is committed only after delivery.** A detection is emitted and its per-subject cooldown claimed in the same batch. If the batch's produce fails, the detection engine releases the cooldown claims before retrying, so the retry re-emits the detection instead of suppressing it as a "repeat" of one that was never delivered.
 - **End-to-end at-least-once, commit after durable delivery.** Auto-commit is off. Handlers receive the whole poll batch (so they can pipeline their I/O). Before committing, the loop flushes the producer and verifies every message the batch produced (detections, audit records, DLQ records) was acknowledged by the broker; only then are the input offsets committed. So a crash between handling a record and delivering its detection cannot commit the input offset with the detection lost — the record is redelivered. Every detector and containment action tolerates redelivery (replay detection recognises the same Kafka delivery; sorted-set members are event ids; enforcement writes are SETEX).
 - **Transient failures block, they do not skip.** If Redis is unreachable, timing out, loading, out of memory or read-only, the whole batch is retried in place with exponential backoff (0.5s → 30s) and nothing is committed; every phase is idempotent so repeating a half-done batch is safe. Detections are not lost while a dependency is down; the pipeline visibly stalls and `processing_errors_total{kind="transient"}` climbs.
 - **Poison records go to the DLQ.** Undecodable JSON and schema validation failures are reported per record by the handler; those records (or, for an unexpected exception, the whole batch) are written to `rtace-dlq` with the source topic/partition/offset, the base64 raw payload and the error, then committed past so one bad record cannot wedge a partition. Inspect with:
@@ -525,7 +526,7 @@ Every phase is idempotent, so a batch interrupted by a Redis error is simply ret
 
 **Detection identity**
 
-- `detection_id` is a fresh UUID per detection (`det-replay-…`, `det-geo-…`, `det-burst-…`, `det-cred-user-…`, `det-cred-ip-…`). It is never derived from the triggering event id, because one event can legitimately yield several detections over time. `transaction_id` carries the triggering event id.
+- `detection_id` is deterministic per (Kafka delivery, detector, scope) — `det-replay-…`, `det-geo-…`, `det-burst-…`, `det-cred-user-…`, `det-cred-ip-…`, a UUIDv5 of `{topic:partition:offset}:{type}:{scope}`. A record redelivered by Kafka, or a batch reprocessed after a produce failure, yields the **same** id, which is what lets containment apply it exactly once. Detections are delivered at least once (a redelivery may re-emit a duplicate message), and every downstream consumer is idempotent by this id. `transaction_id` carries the triggering event id.
 - Every detection has a `details` object with the detector's evidence (counts, window, velocity, scope, first-seen record).
 
 ## License

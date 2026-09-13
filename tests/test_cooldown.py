@@ -50,3 +50,31 @@ def test_cooldown_key_expires(redis_client, redis_config):
     cfg = replace(redis_config, detection_cooldown_seconds=30)
     should_emit(_det(), redis_client, cfg)
     assert 0 < redis_client.ttl("cooldown:fraud_burst:user:user_1") <= 30
+
+
+def test_filter_returns_claimed_keys_and_release_reenables(redis_client, redis_config):
+    from detection_engine.cooldown import cooldown_key, filter_cooled_down, release_cooldown
+
+    d = _det("fraud_burst", "u1")
+    allowed, claimed = filter_cooled_down([d], redis_client, redis_config)
+    assert allowed == [d]
+    assert claimed == [cooldown_key(d)]
+    assert redis_client.exists(cooldown_key(d))
+
+    # A repeat is suppressed and claims nothing.
+    allowed2, claimed2 = filter_cooled_down([_det("fraud_burst", "u1")], redis_client, redis_config)
+    assert allowed2 == [] and claimed2 == []
+
+    # Releasing the claim lets the next call win again (the delivery-failed path).
+    release_cooldown(claimed, redis_client)
+    assert not redis_client.exists(cooldown_key(d))
+    allowed3, _ = filter_cooled_down([_det("fraud_burst", "u1")], redis_client, redis_config)
+    assert len(allowed3) == 1
+
+
+def test_zero_cooldown_claims_nothing(redis_client, redis_config):
+    from detection_engine.cooldown import filter_cooled_down
+
+    cfg = replace(redis_config, detection_cooldown_seconds=0)
+    allowed, claimed = filter_cooled_down([_det(), _det()], redis_client, cfg)
+    assert len(allowed) == 2 and claimed == []

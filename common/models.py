@@ -15,6 +15,21 @@ def new_detection_id(prefix: str) -> str:
     return f"det-{prefix}-{uuid.uuid4()}"
 
 
+_DETECTION_ID_NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_URL
+
+
+def stable_detection_id(prefix: str, ref: str, detection_type: str, scope: str = "") -> str:
+    """Deterministic detection id for one (Kafka delivery, detector, scope).
+
+    A record redelivered by Kafka, or a batch reprocessed after a produce
+    failure, must yield the SAME detection id so that containment (keyed by
+    detection id) applies it exactly once. Derived from the delivery ref plus
+    the detector identity, which is unique per record and per detector output.
+    """
+    identity = f"{ref}:{detection_type}:{scope}"
+    return f"det-{prefix}-{uuid.uuid5(_DETECTION_ID_NS, identity)}"
+
+
 class TransactionEvent(BaseModel):
     """Incoming transaction event from the simulator."""
 

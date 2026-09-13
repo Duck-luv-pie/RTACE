@@ -28,6 +28,7 @@ class RedisConfig:
     auth_fail_key_ttl_seconds: int
     ip_block_ttl_seconds: int
     step_up_ttl_seconds: int
+    containment_receipt_ttl_seconds: int
     detection_cooldown_seconds: int
 
     @classmethod
@@ -49,5 +50,8 @@ class RedisConfig:
             auth_fail_key_ttl_seconds=int(os.getenv("REDIS_AUTH_FAIL_KEY_TTL_SECONDS", "120")),
             ip_block_ttl_seconds=int(os.getenv("REDIS_IP_BLOCK_TTL_SECONDS", "3600")),
             step_up_ttl_seconds=int(os.getenv("REDIS_STEP_UP_TTL_SECONDS", "900")),
+            # Must outlive Kafka retention so a redelivered detection still finds
+            # its receipt and is not re-applied. Default 8 days > 7-day retention.
+            containment_receipt_ttl_seconds=int(os.getenv("REDIS_CONTAINMENT_RECEIPT_TTL_SECONDS", str(8 * 24 * 3600))),
             detection_cooldown_seconds=int(os.getenv("DETECTION_COOLDOWN_SECONDS", "60")),
         )

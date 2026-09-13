@@ -29,6 +29,8 @@ def test_redelivered_record_produces_no_detection(make_pipeline, kafka_config):
 
 
 def test_geo_and_burst_can_fire_on_the_same_transaction(make_pipeline):
+    # threshold 1 so the SECOND transaction (count 2) is the one that both bursts
+    # and travels impossibly — the point is two detectors firing on one record.
     p, out, _ = make_pipeline(burst_threshold=1)
     p.handle_transaction(tx(coords=SF), "r1")
     p.handle_transaction(tx(coords=LONDON, at=later(30)), "r2")
@@ -97,3 +99,40 @@ def test_outcome_counter_counts_suppressed_detections_as_detected(make_pipeline,
         p.handle_record(kafka_config.tx_events_topic, 0, off, payload)
     assert _counter("detected") - before == 2
     assert len(out) == 1
+
+
+def test_detection_ids_are_stable_across_redelivery(make_pipeline, kafka_config):
+    """The same Kafka delivery reprocessed yields the same detection id, so
+    containment (keyed by id) applies it exactly once."""
+    p, out, _ = make_pipeline(burst_threshold=0, detection_cooldown_seconds=0)
+    rec = (kafka_config.tx_events_topic, 5, 42, tx(user_id="u1").model_dump(mode="json"))
+    first = p.handle_batch([rec]).emitted
+    second = p.handle_batch([rec]).emitted  # redelivery: same topic/partition/offset
+    assert first and second
+    assert {d.detection_id for d in first} == {d.detection_id for d in second}
+
+
+def test_different_deliveries_get_different_ids(make_pipeline, kafka_config):
+    p, out, _ = make_pipeline(burst_threshold=0, detection_cooldown_seconds=0)
+    a = p.handle_batch([(kafka_config.tx_events_topic, 0, 1, tx(user_id="u1").model_dump(mode="json"))]).emitted
+    b = p.handle_batch([(kafka_config.tx_events_topic, 0, 2, tx(user_id="u1").model_dump(mode="json"))]).emitted
+    assert {d.detection_id for d in a}.isdisjoint({d.detection_id for d in b})
+
+
+def test_batch_result_reports_claimed_cooldown_keys(make_pipeline, kafka_config):
+    p, out, _ = make_pipeline(burst_threshold=0)
+    result = p.handle_batch([(kafka_config.tx_events_topic, 0, 1, tx(user_id="u1").model_dump(mode="json"))])
+    assert result.claimed_cooldown_keys  # burst detection claimed a cooldown
+    # Releasing them lets the same detection be re-emitted on a retry.
+    p.release_cooldown(result.claimed_cooldown_keys)
+    again = p.handle_batch([(kafka_config.tx_events_topic, 0, 1, tx(user_id="u1").model_dump(mode="json"))]).emitted
+    assert [d.detection_type for d in again] == ["fraud_burst"]
+
+
+def test_cooldown_suppresses_retry_without_release(make_pipeline, kafka_config):
+    """Guards the bug this fix targets: without releasing the claim, a reprocess
+    is suppressed (which is why the consumer releases on delivery failure)."""
+    p, out, _ = make_pipeline(burst_threshold=0)
+    rec = (kafka_config.tx_events_topic, 0, 1, tx(user_id="u1").model_dump(mode="json"))
+    assert p.handle_batch([rec]).emitted  # first emits + claims cooldown
+    assert p.handle_batch([rec]).emitted == []  # reprocess suppressed by the claim

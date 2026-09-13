@@ -37,29 +37,45 @@ def filter_cooled_down(
     detections: Sequence[DetectionEvent],
     redis_client,
     redis_config: Optional[RedisConfig] = None,
-) -> list[DetectionEvent]:
-    """Return the subset of detections that may be emitted; count the rest as suppressed."""
+) -> tuple[list[DetectionEvent], list[str]]:
+    """Reserve the cooldown for each first-in-window detection.
+
+    Returns ``(allowed, claimed_keys)``: the detections that won their cooldown
+    (and so may be emitted), and the cooldown keys this call set. The keys are
+    returned so the caller can *release* them with ``release_cooldown`` if the
+    detections are not durably delivered — otherwise a cooldown claimed on an
+    attempt whose Kafka produce failed would suppress the detection on retry and
+    lose it. Cooldown keys are committed (kept) only once delivery succeeds.
+    """
     config = redis_config or RedisConfig.from_env()
     if not detections:
-        return []
+        return [], []
     if config.detection_cooldown_seconds <= 0:
-        return list(detections)
+        return list(detections), []
 
     with observe_redis_latency("cooldown_batch"):
         with redis_client.pipeline(transaction=False) as pipe:
             for d in detections:
-                pipe.set(cooldown_key(d), "1", nx=True, ex=config.detection_cooldown_seconds)
+                pipe.set(cooldown_key(d), d.detection_id, nx=True, ex=config.detection_cooldown_seconds)
             acquired = pipe.execute()
 
-    allowed = []
+    allowed, claimed = [], []
     for d, ok in zip(detections, acquired):
         if ok:
             allowed.append(d)
+            claimed.append(cooldown_key(d))
         else:
             detections_suppressed_total.labels(detection_type=d.detection_type).inc()
-    return allowed
+    return allowed, claimed
+
+
+def release_cooldown(keys: Sequence[str], redis_client) -> None:
+    """Delete cooldown keys claimed for detections that were not delivered, so a
+    retry can re-claim and re-emit them."""
+    if keys:
+        redis_client.delete(*keys)
 
 
 def should_emit(detection: DetectionEvent, redis_client, redis_config: Optional[RedisConfig] = None) -> bool:
     """Single-detection convenience wrapper around filter_cooled_down."""
-    return bool(filter_cooled_down([detection], redis_client, redis_config))
+    return bool(filter_cooled_down([detection], redis_client, redis_config)[0])
