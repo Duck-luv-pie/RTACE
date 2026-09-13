@@ -18,8 +18,6 @@ class RedisConfig:
     replay_ttl_hours: int
     quarantine_ttl_seconds: int
     session_ttl_days: int
-    session_cache_maxsize: int
-    session_cache_ttl_seconds: int
     geo_max_velocity_kmh: float
     burst_window_seconds: int
     burst_threshold: int
@@ -41,8 +39,6 @@ class RedisConfig:
             replay_ttl_hours=int(os.getenv("REDIS_REPLAY_TTL_HOURS", "24")),
             quarantine_ttl_seconds=int(os.getenv("REDIS_QUARANTINE_TTL_SECONDS", "3600")),
             session_ttl_days=int(os.getenv("REDIS_SESSION_TTL_DAYS", "7")),
-            session_cache_maxsize=int(os.getenv("SESSION_CACHE_MAXSIZE", "10000")),
-            session_cache_ttl_seconds=int(os.getenv("SESSION_CACHE_TTL_SECONDS", "300")),
             geo_max_velocity_kmh=float(os.getenv("GEO_MAX_VELOCITY_KMH", "900")),
             burst_window_seconds=int(os.getenv("REDIS_BURST_WINDOW_SECONDS", "60")),
             burst_threshold=int(os.getenv("REDIS_BURST_THRESHOLD", "20")),

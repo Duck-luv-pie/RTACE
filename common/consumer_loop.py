@@ -3,14 +3,17 @@
 Guarantees
 - An offset is committed only after every record up to it has been handled
   (processed, or deliberately dead-lettered). Commits are synchronous and
-  per batch.
-- Transient failures (Redis unreachable, timed out, loading, out of memory)
-  block the partition and retry with exponential backoff instead of skipping
-  the record. Detections are not silently lost while a dependency is down.
+  per poll batch, for exactly the offsets handled.
+- Handlers receive the whole poll batch so they can pipeline their I/O.
+  Transient failures (Redis unreachable, timed out, loading, out of memory,
+  read-only) retry the whole batch with exponential backoff instead of
+  skipping it; every handler is idempotent so a half-processed batch is safe
+  to repeat. Detections are not silently lost while a dependency is down.
 - Permanent failures (undecodable JSON, schema validation, or an unexpected
-  exception inside a handler) are written to the dead-letter topic with the
-  raw payload and the error, counted, and then committed past, so one poison
-  record cannot wedge a partition.
+  exception) are written to the dead-letter topic with the raw payload and
+  the error, counted, and committed past, so one poison record cannot wedge
+  a partition. A handler reports per-record permanent failures by index; an
+  unexpected exception from the handler itself dead-letters the whole batch.
 - SIGINT / SIGTERM set a shutdown event: the current batch finishes (or the
   current retry is abandoned without committing), offsets are committed,
   the producer is flushed and both clients are closed.
@@ -30,11 +33,7 @@ from kafka.errors import KafkaError
 from kafka.structs import OffsetAndMetadata, TopicPartition
 
 from common.kafka_client import decode_json, send_message
-from common.metrics import (
-    consumer_records_total,
-    dlq_messages_total,
-    processing_errors_total,
-)
+from common.metrics import consumer_records_total, dlq_messages_total, processing_errors_total
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +47,11 @@ TRANSIENT_EXCEPTIONS = (
 
 
 class TransientError(Exception):
-    """Raise from a handler to force a retry (offset is not committed)."""
+    """Raise from a handler to force a retry (offsets are not committed)."""
 
 
 class ShutdownRequested(Exception):
-    """Raised internally when shutdown is requested while a record is being retried."""
+    """Raised internally when shutdown is requested while a batch is being retried."""
 
 
 class Record(Protocol):
@@ -63,8 +62,30 @@ class Record(Protocol):
     value: Optional[bytes]
 
 
-Handler = Callable[[str, int, int, object], None]
-"""handler(topic, partition, offset, decoded_value)"""
+DecodedRecord = tuple[str, int, int, object]
+"""(topic, partition, offset, decoded value)"""
+
+BatchHandler = Callable[[list[DecodedRecord]], dict[int, Exception]]
+"""handler(records) -> {index: permanent error} for records that must be dead-lettered"""
+
+RecordHandler = Callable[[str, int, int, object], None]
+
+
+def per_record(handler: RecordHandler) -> BatchHandler:
+    """Adapt a one-record handler to the batch interface; each record's error is its own."""
+
+    def _batch(records: list[DecodedRecord]) -> dict[int, Exception]:
+        failures: dict[int, Exception] = {}
+        for i, (topic, partition, offset, value) in enumerate(records):
+            try:
+                handler(topic, partition, offset, value)
+            except Exception as exc:  # noqa: BLE001 - classified by the loop
+                if _is_transient(exc):
+                    raise
+                failures[i] = exc
+        return failures
+
+    return _batch
 
 
 @dataclass
@@ -91,7 +112,7 @@ def _is_transient(exc: BaseException) -> bool:
 
 def run_consumer_loop(
     consumer,
-    handler: Handler,
+    handler: BatchHandler,
     settings: LoopSettings,
     shutdown: threading.Event,
     producer=None,
@@ -113,21 +134,13 @@ def run_consumer_loop(
             if not batch:
                 continue
 
-            to_commit: dict[TopicPartition, OffsetAndMetadata] = {}
+            records: list[Record] = [r for recs in batch.values() for r in recs]
             try:
-                for tp, records in batch.items():
-                    for record in records:
-                        _handle_with_retry(
-                            record, handler, settings, shutdown, producer, dlq_topic, sleep
-                        )
-                        to_commit[TopicPartition(record.topic, record.partition)] = (
-                            OffsetAndMetadata(record.offset + 1, None, -1)
-                        )
+                _handle_batch_with_retry(records, handler, settings, shutdown, producer, dlq_topic, sleep)
             except ShutdownRequested:
                 logger.info("%s: shutdown requested mid-retry; leaving offsets uncommitted", stage)
-            finally:
-                if to_commit:
-                    _commit(consumer, to_commit, stage)
+                break
+            _commit(consumer, records, stage)
     finally:
         logger.info("%s consumer loop stopping", stage)
         if producer is not None:
@@ -140,7 +153,10 @@ def run_consumer_loop(
         logger.info("%s consumer loop stopped", stage)
 
 
-def _commit(consumer, offsets, stage: str) -> None:
+def _commit(consumer, records: list[Record], stage: str) -> None:
+    offsets: dict[TopicPartition, OffsetAndMetadata] = {}
+    for r in records:
+        offsets[TopicPartition(r.topic, r.partition)] = OffsetAndMetadata(r.offset + 1, None, -1)
     try:
         consumer.commit(offsets=offsets)
     except KafkaError as e:
@@ -149,9 +165,9 @@ def _commit(consumer, offsets, stage: str) -> None:
         logger.error("%s: offset commit failed (%s); records may be redelivered", stage, e)
 
 
-def _handle_with_retry(
-    record: Record,
-    handler: Handler,
+def _handle_batch_with_retry(
+    records: list[Record],
+    handler: BatchHandler,
     settings: LoopSettings,
     shutdown: threading.Event,
     producer,
@@ -159,24 +175,37 @@ def _handle_with_retry(
     sleep: Callable[[float], None],
 ) -> None:
     stage = settings.stage
+
+    # Decode once; undecodable or tombstone records never reach the handler.
+    decoded: list[DecodedRecord] = []
+    decoded_records: list[Record] = []
+    for r in records:
+        try:
+            value = decode_json(r.value)
+        except ValueError as exc:
+            _permanent(r, exc, stage, producer, dlq_topic)
+            continue
+        if value is None:
+            consumer_records_total.labels(stage=stage, result="skipped").inc()
+            continue
+        decoded.append((r.topic, r.partition, r.offset, value))
+        decoded_records.append(r)
+    if not decoded:
+        return
+
     delay = settings.retry_initial_seconds
     attempt = 0
     while True:
         attempt += 1
         try:
-            value = decode_json(record.value)
-            if value is None:
-                consumer_records_total.labels(stage=stage, result="skipped").inc()
-                return
-            handler(record.topic, record.partition, record.offset, value)
-            consumer_records_total.labels(stage=stage, result="processed").inc()
-            return
+            failures = handler(decoded) or {}
         except Exception as exc:  # noqa: BLE001 - classified below
             if _is_transient(exc):
                 processing_errors_total.labels(stage=stage, kind="transient").inc()
+                first = decoded_records[0]
                 logger.warning(
-                    "%s: transient failure on %s[%d]@%d (attempt %d): %s; retrying in %.1fs",
-                    stage, record.topic, record.partition, record.offset, attempt, exc, delay,
+                    "%s: transient failure on batch of %d starting %s[%d]@%d (attempt %d): %s; retrying in %.1fs",
+                    stage, len(decoded), first.topic, first.partition, first.offset, attempt, exc, delay,
                 )
                 if shutdown.is_set():
                     raise ShutdownRequested() from exc
@@ -185,18 +214,23 @@ def _handle_with_retry(
                 if shutdown.is_set():
                     raise ShutdownRequested() from exc
                 continue
-
-            processing_errors_total.labels(stage=stage, kind="permanent").inc()
-            logger.exception(
-                "%s: permanent failure on %s[%d]@%d; dead-lettering",
-                stage, record.topic, record.partition, record.offset,
-            )
-            _dead_letter(record, exc, stage, producer, dlq_topic)
-            consumer_records_total.labels(stage=stage, result="dlq").inc()
+            logger.exception("%s: handler raised on a batch of %d; dead-lettering all of them", stage, len(decoded))
+            for r in decoded_records:
+                _permanent(r, exc, stage, producer, dlq_topic)
             return
 
+        for i, r in enumerate(decoded_records):
+            if i in failures:
+                logger.error("%s: permanent failure on %s[%d]@%d: %s", stage, r.topic, r.partition, r.offset, failures[i])
+                _permanent(r, failures[i], stage, producer, dlq_topic)
+            else:
+                consumer_records_total.labels(stage=stage, result="processed").inc()
+        return
 
-def _dead_letter(record: Record, exc: BaseException, stage: str, producer, dlq_topic) -> None:
+
+def _permanent(record: Record, exc: BaseException, stage: str, producer, dlq_topic) -> None:
+    processing_errors_total.labels(stage=stage, kind="permanent").inc()
+    consumer_records_total.labels(stage=stage, result="dlq").inc()
     dlq_messages_total.labels(stage=stage).inc()
     if producer is None or not dlq_topic:
         logger.error("%s: no DLQ configured; dropping %s[%d]@%d", stage, record.topic, record.partition, record.offset)

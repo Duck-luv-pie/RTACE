@@ -1,4 +1,4 @@
-"""Consumer loop semantics: commit-after-process, retry, DLQ, shutdown."""
+"""Consumer loop semantics: commit-after-process, batch retry, DLQ, shutdown."""
 
 import json
 import threading
@@ -8,7 +8,7 @@ from typing import Optional
 import redis.exceptions as redis_exc
 from kafka.structs import TopicPartition
 
-from common.consumer_loop import LoopSettings, run_consumer_loop
+from common.consumer_loop import LoopSettings, per_record, run_consumer_loop
 from common.models import DetectionEvent
 
 
@@ -67,22 +67,17 @@ class FakeProducer:
 
 def _batch(topic, partition, values, start=0):
     tp = TopicPartition(topic, partition)
-    return {
-        tp: [
-            Rec(topic, partition, start + i, v if isinstance(v, (bytes, type(None))) else json.dumps(v).encode())
-            for i, v in enumerate(values)
-        ]
-    }
+    return {tp: [Rec(topic, partition, start + i, v if isinstance(v, (bytes, type(None))) else json.dumps(v).encode())
+                 for i, v in enumerate(values)]}
 
 
-def _run(batches, handler, producer=None, settings=None):
+def _run(batches, handler, producer=None, settings=None, batch_handler=None):
     shutdown = threading.Event()
     consumer = FakeConsumer(batches, shutdown)
     settings = settings or LoopSettings(stage="test", retry_initial_seconds=0.01, retry_max_seconds=0.02)
     slept = []
-    run_consumer_loop(
-        consumer, handler, settings, shutdown, producer=producer, dlq_topic="dlq", sleep=slept.append
-    )
+    run_consumer_loop(consumer, batch_handler or per_record(handler), settings, shutdown,
+                      producer=producer, dlq_topic="dlq", sleep=slept.append)
     return consumer, slept
 
 
@@ -100,6 +95,19 @@ def test_commit_covers_each_partition_in_the_batch():
     assert consumer.commits == [{TopicPartition("t", 0): 6, TopicPartition("t", 1): 9}]
 
 
+def test_batch_handler_receives_the_whole_poll_batch():
+    sizes = []
+
+    def handler(records):
+        sizes.append(len(records))
+        return {}
+
+    batch = {**_batch("t", 0, [{"a": 1}, {"a": 2}]), **_batch("t", 1, [{"a": 3}])}
+    consumer, _ = _run([batch], None, batch_handler=handler)
+    assert sizes == [3]
+    assert consumer.commits == [{TopicPartition("t", 0): 2, TopicPartition("t", 1): 1}]
+
+
 def test_undecodable_record_is_dead_lettered_and_committed_past():
     producer = FakeProducer()
     seen = []
@@ -107,10 +115,8 @@ def test_undecodable_record_is_dead_lettered_and_committed_past():
     assert seen == [{"ok": 1}]
     assert consumer.commits == [{TopicPartition("t", 0): 2}]
     (topic, payload, _key), = producer.sent
-    assert topic == "dlq"
-    assert payload["source_topic"] == "t" and payload["offset"] == 0
-    assert payload["error_type"] == "ValueError"
-    assert payload["value_base64"] == "bm90IGpzb24="
+    assert topic == "dlq" and payload["source_topic"] == "t" and payload["offset"] == 0
+    assert payload["error_type"] == "ValueError" and payload["value_base64"] == "bm90IGpzb24="
 
 
 def test_schema_failure_is_dead_lettered():
@@ -122,6 +128,17 @@ def test_schema_failure_is_dead_lettered():
     consumer, _ = _run([_batch("t", 0, [{"garbage": True}])], handler, producer)
     assert producer.sent[0][1]["error_type"] == "ValidationError"
     assert consumer.commits == [{TopicPartition("t", 0): 1}]
+
+
+def test_batch_handler_per_index_failures_dead_letter_only_those():
+    producer = FakeProducer()
+
+    def handler(records):
+        return {1: ValueError("bad one")}
+
+    consumer, _ = _run([_batch("t", 0, [{"a": 1}, {"a": 2}, {"a": 3}])], None, producer, batch_handler=handler)
+    assert [p["offset"] for _, p, _ in producer.sent] == [1]
+    assert consumer.commits == [{TopicPartition("t", 0): 3}]
 
 
 def test_unexpected_handler_bug_is_dead_lettered_not_retried_forever():
@@ -136,7 +153,7 @@ def test_unexpected_handler_bug_is_dead_lettered_not_retried_forever():
     assert consumer.commits == [{TopicPartition("t", 0): 1}]
 
 
-def test_redis_outage_blocks_and_retries_with_backoff_until_it_recovers():
+def test_redis_outage_blocks_and_retries_the_batch_with_backoff():
     attempts = {"n": 0}
 
     def handler(*a):
@@ -147,42 +164,24 @@ def test_redis_outage_blocks_and_retries_with_backoff_until_it_recovers():
     producer = FakeProducer()
     consumer, slept = _run([_batch("t", 0, [{"x": 1}])], handler, producer)
     assert attempts["n"] == 4
-    assert slept == [0.01, 0.02, 0.02]  # exponential, capped
-    assert producer.sent == []  # never dead-lettered
+    assert slept == [0.01, 0.02, 0.02]
+    assert producer.sent == []
     assert consumer.commits == [{TopicPartition("t", 0): 1}]
 
 
-def test_shutdown_during_retry_leaves_offset_uncommitted():
+def test_shutdown_during_retry_leaves_offsets_uncommitted():
     shutdown = threading.Event()
     consumer = FakeConsumer([_batch("t", 0, [{"x": 1}, {"x": 2}])], shutdown)
     producer = FakeProducer()
 
     def handler(*a):
-        shutdown.set()  # operator hits Ctrl-C while Redis is down
+        shutdown.set()
         raise redis_exc.TimeoutError("redis slow")
 
-    run_consumer_loop(
-        consumer, handler, LoopSettings(stage="test"), shutdown, producer=producer, dlq_topic="dlq", sleep=lambda s: None
-    )
+    run_consumer_loop(consumer, per_record(handler), LoopSettings(stage="test"), shutdown,
+                      producer=producer, dlq_topic="dlq", sleep=lambda s: None)
     assert consumer.commits == []
     assert producer.flushed and producer.closed and consumer.closed
-
-
-def test_partial_batch_progress_is_committed_when_a_later_record_hits_shutdown():
-    """Records handled before the shutdown-during-retry are committed; the failing one is not."""
-    shutdown = threading.Event()
-    consumer = FakeConsumer([_batch("t", 0, [{"x": 1}, {"x": 2}])], shutdown)
-    calls = []
-
-    def handler(topic, partition, offset, value):
-        calls.append(offset)
-        if offset == 1:
-            shutdown.set()
-            raise redis_exc.ConnectionError("down")
-
-    run_consumer_loop(consumer, handler, LoopSettings(stage="test"), shutdown, sleep=lambda s: None)
-    assert calls == [0, 1]
-    assert consumer.commits == [{TopicPartition("t", 0): 1}]
 
 
 def test_tombstone_is_skipped():

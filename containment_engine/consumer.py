@@ -6,7 +6,7 @@ import threading
 
 from prometheus_client import start_http_server
 
-from common.consumer_loop import LoopSettings, install_signal_handlers, run_consumer_loop
+from common.consumer_loop import LoopSettings, install_signal_handlers, per_record, run_consumer_loop
 from common.kafka_client import create_consumer, create_producer, send_message
 from common.redis_client import create_redis_client
 from configs.kafka_config import KafkaConfig
@@ -55,7 +55,7 @@ def run_containment_engine() -> None:
     )
     run_consumer_loop(
         consumer,
-        pipeline.handle_record,
+        per_record(pipeline.handle_record),
         LoopSettings(stage=STAGE, poll_timeout_ms=kafka_config.poll_timeout_ms),
         shutdown,
         producer=producer,

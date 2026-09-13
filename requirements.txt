@@ -7,5 +7,6 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.5.3
 prometheus_client==0.19.0
-cachetools==7.0.5
 lz4==4.4.5  # required by kafka-python for compression_type=lz4
+hiredis==3.4.1  # C response parser, picked up automatically by redis-py
+crc32c==2.9.post0  # C CRC for kafka-python record batches (pure-Python fallback is 6% of CPU)

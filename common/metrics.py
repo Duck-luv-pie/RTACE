@@ -50,8 +50,8 @@ detections_suppressed_total = Counter(
 )
 detection_pipeline_latency_seconds = Histogram(
     "detection_pipeline_latency_seconds",
-    "Time to process a transaction through the detection pipeline",
-    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+    "Per-record time through the detection pipeline (batch wall time divided by batch size)",
+    buckets=(0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0),
     registry=REGISTRY,
 )
 
@@ -96,11 +96,10 @@ kafka_send_failures_total = Counter(
     registry=REGISTRY,
 )
 
-# Session L1 cache
-session_cache_requests_total = Counter(
-    "session_cache_requests_total",
-    "L1 session cache lookups, by result",
-    ["result"],  # hit | miss
+detection_batch_size = Histogram(
+    "detection_batch_size",
+    "Records per poll batch handed to the detection pipeline",
+    buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000),
     registry=REGISTRY,
 )
 
@@ -109,7 +108,7 @@ redis_operation_latency_seconds = Histogram(
     "redis_operation_latency_seconds",
     "Redis operation latency in seconds",
     ["operation"],
-    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+    buckets=(0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
     registry=REGISTRY,
 )
 

@@ -118,15 +118,16 @@ Then run the Python services exactly as above. Notes:
 
 ## Performance
 
-Measured on an Apple Silicon laptop with Kafka and Redis installed via Homebrew, one detection-engine process, no contention (2026-09):
+Measured on an Apple Silicon laptop with Kafka and Redis in Docker Desktop, one detection-engine process draining a pre-loaded backlog of 5,000 users' traffic (2026-09):
 
-| Path | Redis round trips per record | Throughput per process | p50 / p99 pipeline latency |
-|------|------------------------------|------------------------|----------------------------|
-| Transaction, full detector path | 4 (enforcement, replay, session write, burst) | ~4,400 records/s | 0.5 ms / 1.0 ms |
-| Successful login or blocked event | 1 | ~19,000 records/s | |
-| Mixed backlog (50/50) | | ~7,000 records/s | |
+| Engine version | Mixed backlog (50% transactions, 50% logins) | Process CPU | Per-record time p50 / p99 |
+|----------------|-----------------------------------------------|-------------|---------------------------|
+| per-record Redis calls (4 round trips per transaction) | ~7,000 records/s | ~100% of one core | 500 µs / 1 ms |
+| batched + Lua (this version) | **~28,700 records/s** | ~55% of one core | 18 µs / 98 µs |
 
-The producer side is not the bottleneck (the simulator sustained ~35,000 events/s). The engine is bound by sequential Redis round trips plus per-record Python work, so it scales linearly with processes up to the 16 partitions per topic, and a single Redis instance saturates around 25,000 full-path transactions/s. To go beyond that: pipeline Redis work across a whole poll batch, collapse the per-transaction checks into one Lua script, switch to confluent-kafka, and shard Redis.
+Per poll batch of ~375 records the engine now spends about 1.8 ms in the enforcement pipeline and 2.9 ms in the Lua pipeline (7–8 µs of Redis time per transaction). A CPU profile of the batched engine put 38% of time in redis-py command encoding/response parsing, 15% in kafka-python, 7% in RTACE code and 0.3% in Pydantic; `hiredis` and `crc32c` (both in `requirements.txt`, picked up automatically) buy the last ~8%.
+
+Scaling: run one detection process per partition (16 by default). A single Redis executes the Lua script in under 10 µs, so it saturates somewhere above 100,000 transactions/s; shard by user before that. The next single-process step would be overlapping Redis I/O with parsing of the following batch (a two-stage thread or asyncio pipeline), since the process is now idle about half the time. Replacing kafka-python with confluent-kafka would gain under 20% and was not done.
 
 ## Prometheus metrics
 
@@ -140,22 +141,22 @@ Each component exposes Prometheus metrics:
 
 **Metrics exposed:**
 
-- `transactions_processed_total{outcome}` — transactions processed (outcome: `clean` \| `detected` \| `blocked`; detected = any detector fired)
+- `transactions_processed_total{outcome}` — transactions processed (outcome: `clean` \| `detected` \| `blocked` \| `prescored`; detected = any detector fired, prescored = already scored by the decision service)
 - `replay_detections_total{detection_type}` — replay attacks detected
 - `geo_velocity_detections_total{detection_type}` — geo velocity (impossible travel) anomalies detected
 - `fraud_burst_detections_total{detection_type}` — fraud burst (too many transactions in rolling window) detections
 - `credential_stuffing_detections_total{scope}` — credential stuffing (`scope`: `user` \| `ip`)
 - `detections_suppressed_total{detection_type}` — detections dropped by the per-subject cooldown (see **Detection cooldown**)
 - `replay_redeliveries_total` — transactions whose replay key was written by the *same* Kafka record (at-least-once redelivery, not a replay)
-- `session_cache_requests_total{result}` — L1 session cache lookups (`hit` \| `miss`)
+- `detection_batch_size` — records per poll batch handed to the detection pipeline
 - `consumer_records_total{stage,result}` — records handled by each consumer loop (`processed` \| `dlq` \| `skipped`)
 - `processing_errors_total{stage,kind}` — handler failures (`transient` = retried in place, `permanent` = dead-lettered)
 - `dlq_messages_total{stage}` — records written to `rtace-dlq`
 - `kafka_send_failures_total{topic}` — async producer sends that failed after retries
 - `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine` \| `step_up_auth` \| `ip_block`)
 - `events_blocked_total{event_type,reason}` — events the detection engine refused because a rule was active (`transaction`/`quarantine`, `auth`/`ip_block`); blocked transactions also appear as `transactions_processed_total{outcome="blocked"}`
-- `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
-- `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
+- `redis_operation_latency_seconds{operation}` — Redis round-trip latency per phase (`enforce_batch`, `detect_batch`, `cooldown_batch`, `decision_fetch`, `setex_quarantine`, `ping`, `scan_enforcement`)
+- `detection_pipeline_latency_seconds` — per-record time through the detection pipeline (batch wall time divided by batch size)
 
 **Viewing metrics locally**
 
@@ -309,8 +310,6 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `REDIS_STEP_UP_TTL_SECONDS` | `900` | How long a geo-velocity step-up requirement stays pending (15 min) |
 | `RTACE_API_TOKEN` | unset | Bearer token for `/enforcement`. When unset, reads are open and manual overrides answer 503 |
 | `REDIS_SESSION_TTL_DAYS` | `7` | User session (last location) TTL for geo velocity (days) |
-| `SESSION_CACHE_MAXSIZE` | `10000` | Entries in the in-process (L1) session cache |
-| `SESSION_CACHE_TTL_SECONDS` | `300` | Max age of an L1 session entry before Redis is consulted again |
 | `GEO_MAX_VELOCITY_KMH` | `900` | Implied speed above which a transaction is an impossible-travel anomaly |
 | `REDIS_BURST_WINDOW_SECONDS` | `60` | Rolling window length for fraud burst (seconds) |
 | `REDIS_BURST_THRESHOLD` | `20` | Max transactions allowed in the window; detection when count **exceeds** this (i.e. 21+ in 60s by default) |
@@ -327,7 +326,8 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 ```
 RTACE/
 ├── simulator/           # Traffic generator with tagged attack scenarios (tx-events, auth-events)
-├── detection_engine/    # Detectors, cooldown, DetectionPipeline; tx-events + auth-events → detections
+├── lua/                 # tx_check.lua, auth_check.lua: the per-event checks, shared by Python and Go
+├── detection_engine/    # Batched DetectionPipeline, detector interpreters, cooldown
 ├── containment_engine/  # ContainmentPipeline + policy; detections → Redis rules + audit-log
 ├── api/                 # FastAPI control API (rules, manual overrides, health, metrics)
 ├── common/              # Models, Kafka/Redis clients, consumer loop, enforcement reads, metrics
@@ -367,9 +367,9 @@ Every action is idempotent (SETEX), so redelivered detections are harmless.
 
 Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 
-- **At-least-once, commit after processing.** Auto-commit is off. Offsets are committed synchronously after each poll batch, and only for records that were processed or deliberately dead-lettered. Every detector and containment action tolerates redelivery (replay detection recognises the same Kafka record; sorted-set members are event ids; enforcement writes are SETEX).
-- **Transient failures block, they do not skip.** If Redis is unreachable, timing out, loading, out of memory or read-only, the failing record is retried in place with exponential backoff (0.5s → 30s) and its offset is not committed. Detections are not lost while a dependency is down; the pipeline visibly stalls and `processing_errors_total{kind="transient"}` climbs.
-- **Poison records go to the DLQ.** Undecodable JSON, schema validation failures and unexpected exceptions inside a handler are written to `rtace-dlq` with the source topic/partition/offset, the base64 raw payload and the error, then committed past so one bad record cannot wedge a partition. Inspect with:
+- **At-least-once, commit after processing.** Auto-commit is off. Handlers receive the whole poll batch (so they can pipeline their I/O) and offsets are committed synchronously afterwards, only for records that were processed or deliberately dead-lettered. Every detector and containment action tolerates redelivery (replay detection recognises the same Kafka record; sorted-set members are event ids; enforcement writes are SETEX).
+- **Transient failures block, they do not skip.** If Redis is unreachable, timing out, loading, out of memory or read-only, the whole batch is retried in place with exponential backoff (0.5s → 30s) and nothing is committed; every phase is idempotent so repeating a half-done batch is safe. Detections are not lost while a dependency is down; the pipeline visibly stalls and `processing_errors_total{kind="transient"}` climbs.
+- **Poison records go to the DLQ.** Undecodable JSON and schema validation failures are reported per record by the handler; those records (or, for an unexpected exception, the whole batch) are written to `rtace-dlq` with the source topic/partition/offset, the base64 raw payload and the error, then committed past so one bad record cannot wedge a partition. Inspect with:
 
   ```bash
   kafka-console-consumer --bootstrap-server localhost:9092 --topic rtace-dlq --from-beginning
@@ -399,35 +399,50 @@ Knobs, as environment variables or flags (flags win): `SIM_INTERVAL_SECONDS` / `
 - **Transaction events** (`tx-events`): `event_id`, `user_id`, `amount`, `merchant`, `timestamp`, `location`, `latitude`, `longitude`.
 - **Authentication events** (`auth-events`): `event_id`, `user_id`, `ip_address`, `success` (boolean), `timestamp`. Used for credential stuffing detection only (failed attempts).
 
+## How the detection engine processes a batch
+
+The detection engine pulls up to `KAFKA_MAX_POLL_RECORDS` records per poll and handles them as one batch with a fixed, small number of Redis round trips instead of about four per record:
+
+| Phase | Redis round trips per batch | What |
+|-------|-----------------------------|------|
+| A. enforcement | 1 | pipelined `EXISTS` of the quarantine key (transactions) or IP-block key (logins); blocked events stop here |
+| B. checks | 1 | pipelined Lua calls: `lua/tx_check.lua` per transaction, `lua/auth_check.lua` per failed login |
+| C. pre-scored | 0 or 1 | pipelined `GET` of the decision service's stored verdicts, only for events it already scored |
+| D. cooldown | 0 or 1 | pipelined `SET NX` per candidate detection, only if there are any |
+
+`lua/tx_check.lua` is one atomic script that does the replay `SET NX`, the burst window trim/add/count, the session read, the Haversine distance, the trusted-baseline decision and the session write, and returns everything the detectors need. The same file is loaded by the Go decision service, so the detection semantics exist in exactly one place. Floats come back as strings because Redis truncates Lua numbers to integers.
+
+Every phase is idempotent, so a batch interrupted by a Redis error is simply retried whole.
+
 ## Detection modules
 
-**Replay detection**
+**Replay detection** (`lua/tx_check.lua`, interpreted by `detection_engine/replay_detector.py`)
 
 - Each transaction is hashed (user, amount to the cent, merchant, timestamp, location). The timestamp is part of the hash on purpose: a replay resends a captured request byte-for-byte, and excluding it would make two identical legitimate purchases on the same day a false positive.
 - Each hash gets its own key `replay:seen:{hash}` written with `SET NX EX`, so the 24h window slides per transaction. There is no day-boundary hole and unrelated writes never refresh another transaction's expiry.
-- The key's value is the Kafka record (`topic:partition:offset`) that first carried the transaction. Kafka is at-least-once: if the **same record** is delivered again after a crash, the stored value matches and it is counted in `replay_redeliveries_total`, not flagged. A real replay arrives in a **different** record → **replay_attack** (severity high) is emitted with the original record in `details.first_seen_record`.
+- The key's value identifies the **delivery** that first carried the transaction: the Kafka record (`topic:partition:offset`) or `decision:{event_id}` when the synchronous decision service scored it first. Kafka is at-least-once: if the **same record** is delivered again after a crash, the stored value matches and it is counted in `replay_redeliveries_total`, not flagged. An event the decision service already scored is marked `prescored`: its state is not advanced again and the decision's findings are re-emitted as detections so containment and the audit log stay consistent. A real replay arrives through a **different** delivery → **replay_attack** (severity high) with the original delivery in `details.first_seen_record`.
 - Containment: quarantine (see **Containment policy**).
 
-**Geo velocity (impossible travel)**
+**Geo velocity (impossible travel)** (`lua/tx_check.lua`, interpreted by `detection_engine/geo_velocity_detector.py`)
 
-- For each transaction, the user’s last location and timestamp are read from Redis key `session:{user_id}` (hash: `last_latitude`, `last_longitude`, `last_timestamp`).
+- For each transaction, the user’s last trusted location and time are read from Redis key `session:{user_id}` (hash: `lat`, `lon`, `ts` as unix seconds).
 - Distance is computed with the Haversine formula; velocity = distance_km / time_hours (gaps under one second are scored as one second, so a large jump in a tiny interval is flagged rather than skipped).
 - If velocity > `GEO_MAX_VELOCITY_KMH` (default 900) → **geo_velocity_anomaly** detection (severity high) with distance, elapsed time and velocity in `details`.
 - The session is the user's last **trusted** position. It advances only on clean transactions: a flagged location never becomes the baseline (otherwise the user's next purchase from home would be flagged too), and a transaction older than the baseline (late/out-of-order delivery) is ignored rather than rewinding it. A genuine relocation is accepted once enough time has passed for the implied speed to be plausible.
-- Session hash `session:{user_id}` has a 7-day TTL and is fronted by a per-process TTL cache (`SESSION_CACHE_*`) that is cleared whenever the consumer loses Kafka partitions.
+- Session hash `session:{user_id}` has a 7-day TTL. The read, the Haversine computation, the baseline rules and the write all happen inside `lua/tx_check.lua`, so there is no per-process cache to go stale.
 - Containment: **step-up authentication**, escalating to quarantine on a repeat (see **Containment policy**).
 
-**Fraud burst (rolling transaction rate)**
+**Fraud burst (rolling transaction rate)** (`lua/tx_check.lua`, interpreted by `detection_engine/fraud_burst_detector.py`)
 
 - Per user, a Redis **sorted set** `burst:{user_id}:1m` stores recent transactions: **member** = transaction id (`event_id`), **score** = unix timestamp (seconds).
-- On each transaction: remove members with score **older than** the rolling window (default **60 seconds**), add the current transaction, **count** members in the set.
+- On each transaction, inside the Lua script: remove members with score **older than** the rolling window (default **60 seconds**), add the current transaction, **count** members in the set.
 - If the count **exceeds** the configurable threshold (default **20**, i.e. **21+** transactions in the window), emit **fraud_burst** (severity high) to `detections`.
 - The sorted set key is given a **TTL** (default **120 seconds**) so it expires automatically after inactivity.
 - Metric: `fraud_burst_detections_total{detection_type}`.
 - Grafana: **Fraud burst detections (rate)** panel on the RTACE dashboard.
 - Containment: quarantine (see **Containment policy**).
 
-**Credential stuffing**
+**Credential stuffing** (`lua/auth_check.lua`, interpreted by `detection_engine/credential_stuffing_detector.py`)
 
 - Consumes **authentication events** from `auth-events` (failed logins only; successes are ignored).
 - **Account-targeted:** Redis sorted set `auth:fail:user:{user_id}:1m` — member = `event_id`, score = unix time. Entries older than the rolling window (default **60s**) are removed. If count **exceeds** the user threshold (default **10**, i.e. **11+** fails), emit **credential_stuffing** with metric scope `user`.

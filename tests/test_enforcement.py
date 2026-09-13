@@ -2,36 +2,18 @@
 
 from dataclasses import replace
 
-import pytest
-
-from common import session_cache
 from common.enforcement import ip_block_key, quarantine_key, step_up_key
-from configs.kafka_config import KafkaConfig
 from containment_engine.containment_actions import apply_containment
-from detection_engine.pipeline import DetectionPipeline
 from tests.factories import LONDON, SF, auth, later, tx
 from tests.test_containment import _det
 
 
-@pytest.fixture(autouse=True)
-def _fresh_cache():
-    session_cache.clear()
-    yield
-    session_cache.clear()
-
-
-def _pipeline(redis_client, redis_config):
-    out, audits = [], []
-    p = DetectionPipeline(redis_client, out.append, KafkaConfig.from_env(), redis_config, emit_audit=audits.append)
-    return p, out, audits
-
-
-def test_quarantined_user_transactions_are_refused_and_not_analysed(redis_client, redis_config):
-    p, out, audits = _pipeline(redis_client, redis_config)
+def test_quarantined_user_transactions_are_refused_and_not_analysed(make_pipeline, redis_client, kafka_config):
+    p, out, audits = make_pipeline()
     redis_client.setex(quarantine_key("user_1"), 60, "det-x")
     payload = tx().model_dump(mode="json")
-    p.handle_record("tx-events", 0, 1, payload)
-    p.handle_record("tx-events", 0, 2, payload)  # would be a replay if analysed
+    p.handle_record(kafka_config.tx_events_topic, 0, 1, payload)
+    p.handle_record(kafka_config.tx_events_topic, 0, 2, payload)
     assert out == []
     assert redis_client.keys("replay:seen:*") == []
     assert redis_client.exists("session:user_1") == 0
@@ -39,9 +21,8 @@ def test_quarantined_user_transactions_are_refused_and_not_analysed(redis_client
     assert audits[0]["reason"] == "quarantine"
 
 
-def test_blocked_ip_login_attempts_do_not_feed_stuffing_counters(redis_client, redis_config):
-    cfg = replace(redis_config, auth_fail_user_threshold=1)
-    p, out, audits = _pipeline(redis_client, cfg)
+def test_blocked_ip_login_attempts_do_not_feed_stuffing_counters(make_pipeline, redis_client):
+    p, out, audits = make_pipeline(auth_fail_user_threshold=1)
     redis_client.setex(ip_block_key("2001:db8::1"), 60, "det-x")
     for i in range(5):
         p.handle_auth(auth(ip="2001:db8::1", at=later(i)))
@@ -50,8 +31,21 @@ def test_blocked_ip_login_attempts_do_not_feed_stuffing_counters(redis_client, r
     assert audits[0]["event"] == "auth_blocked" and audits[0]["ip_address"] == "2001:db8::1"
 
 
-def test_step_up_does_not_block_transactions(redis_client, redis_config):
-    p, out, _ = _pipeline(redis_client, redis_config)
+def test_blocked_and_unblocked_records_in_one_batch(make_pipeline, redis_client, kafka_config):
+    p, out, audits = make_pipeline()
+    redis_client.setex(quarantine_key("bad"), 60, "det-x")
+    t = kafka_config.tx_events_topic
+    result = p.handle_batch([
+        (t, 0, 1, tx(user_id="bad").model_dump(mode="json")),
+        (t, 0, 2, tx(user_id="good").model_dump(mode="json")),
+    ])
+    assert result.failures == {}
+    assert [a["user_id"] for a in audits] == ["bad"]
+    assert redis_client.exists("session:good") == 1 and redis_client.exists("session:bad") == 0
+
+
+def test_step_up_does_not_block_transactions(make_pipeline, redis_client):
+    p, out, _ = make_pipeline()
     redis_client.setex(step_up_key("user_1"), 60, "det-x")
     p.handle_transaction(tx(coords=SF), "r1")
     assert redis_client.exists("session:user_1") == 1
@@ -77,10 +71,10 @@ def test_hard_signals_still_quarantine(redis_client, redis_config):
     assert apply_containment(_det("fraud_burst", user="u2"), redis_client, redis_config) == ["quarantine"]
 
 
-def test_end_to_end_geo_then_blocked_after_escalation(redis_client, redis_config):
+def test_end_to_end_geo_then_blocked_after_escalation(make_pipeline, redis_client, redis_config):
     """Detection -> containment -> enforcement, all against one Redis."""
     cfg = replace(redis_config, detection_cooldown_seconds=0)
-    p, out, audits = _pipeline(redis_client, cfg)
+    p, out, audits = make_pipeline(detection_cooldown_seconds=0)
     p.handle_transaction(tx(coords=SF), "r1")
     p.handle_transaction(tx(coords=LONDON, at=later(600)), "r2")
     assert apply_containment(out[-1], redis_client, cfg) == ["step_up_auth"]

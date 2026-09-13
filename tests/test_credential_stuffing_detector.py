@@ -1,58 +1,43 @@
-from dataclasses import replace
-
-from detection_engine.credential_stuffing_detector import check_credential_stuffing
 from tests.factories import auth, later
 
 
-def test_successful_logins_are_ignored(redis_client, redis_config):
-    cfg = replace(redis_config, auth_fail_user_threshold=0)
-    assert check_credential_stuffing(auth(success=True), redis_client, cfg) == (None, None)
+def test_successful_logins_are_ignored(make_pipeline, redis_client):
+    p, out, _ = make_pipeline(auth_fail_user_threshold=0)
+    assert p.handle_auth(auth(success=True)) == []
     assert redis_client.keys("auth:fail:*") == []
 
 
-def test_user_scope_fires_above_threshold(redis_client, redis_config):
-    cfg = replace(redis_config, auth_fail_user_threshold=2, auth_fail_ip_threshold=100)
+def test_user_scope_fires_above_threshold(make_pipeline):
+    p, out, _ = make_pipeline(auth_fail_user_threshold=2, auth_fail_ip_threshold=100)
     ips = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
-    outcomes = [check_credential_stuffing(auth(ip=ip, at=later(i)), redis_client, cfg) for i, ip in enumerate(ips)]
-    assert outcomes[0] == (None, None) and outcomes[1] == (None, None)
-    det_user, det_ip = outcomes[2]
-    assert det_user is not None and det_ip is None
-    assert det_user.details["scope"] == "user"
-    assert det_user.ip_address == "10.0.0.3"
+    outcomes = [p.handle_auth(auth(ip=ip, at=later(i))) for i, ip in enumerate(ips)]
+    assert outcomes[0] == [] and outcomes[1] == []
+    (det,) = outcomes[2]
+    assert det.details["scope"] == "user" and det.ip_address == "10.0.0.3"
 
 
-def test_ip_scope_fires_across_many_users(redis_client, redis_config):
-    cfg = replace(redis_config, auth_fail_user_threshold=100, auth_fail_ip_threshold=2)
-    outcomes = [
-        check_credential_stuffing(auth(user_id=f"u{i}", ip="203.0.113.9", at=later(i)), redis_client, cfg)
-        for i in range(3)
-    ]
-    det_user, det_ip = outcomes[2]
-    assert det_user is None and det_ip is not None
-    assert det_ip.details["scope"] == "ip"
+def test_ip_scope_fires_across_many_users(make_pipeline):
+    p, out, _ = make_pipeline(auth_fail_user_threshold=100, auth_fail_ip_threshold=2)
+    outcomes = [p.handle_auth(auth(user_id=f"u{i}", ip="203.0.113.9", at=later(i))) for i in range(3)]
+    (det,) = outcomes[2]
+    assert det.details["scope"] == "ip"
 
 
-def test_both_scopes_can_fire_on_one_event(redis_client, redis_config):
-    cfg = replace(redis_config, auth_fail_user_threshold=1, auth_fail_ip_threshold=1)
-    check_credential_stuffing(auth(), redis_client, cfg)
-    det_user, det_ip = check_credential_stuffing(auth(at=later(1)), redis_client, cfg)
-    assert det_user and det_ip
+def test_both_scopes_can_fire_on_one_event(make_pipeline):
+    p, out, _ = make_pipeline(auth_fail_user_threshold=1, auth_fail_ip_threshold=1)
+    p.handle_auth(auth())
+    det_user, det_ip = p.handle_auth(auth(at=later(1)))
+    assert {det_user.details["scope"], det_ip.details["scope"]} == {"user", "ip"}
     assert det_user.detection_id != det_ip.detection_id
 
 
-def test_ipv6_keys_are_sanitised(redis_client, redis_config):
-    check_credential_stuffing(auth(ip="2001:db8::1"), redis_client, redis_config)
+def test_ipv6_keys_are_sanitised(make_pipeline, redis_client):
+    p, out, _ = make_pipeline()
+    p.handle_auth(auth(ip="2001:db8::1"))
     assert redis_client.exists("auth:fail:ip:2001-db8--1:1m")
 
 
-def test_whole_check_is_one_round_trip(redis_client, redis_config):
-    calls = []
-    original = redis_client.pipeline
-
-    def counting_pipeline(*a, **kw):
-        calls.append(1)
-        return original(*a, **kw)
-
-    redis_client.pipeline = counting_pipeline
-    check_credential_stuffing(auth(), redis_client, redis_config)
-    assert len(calls) == 1
+def test_window_keys_expire(make_pipeline, redis_client):
+    p, out, _ = make_pipeline(auth_fail_key_ttl_seconds=50)
+    p.handle_auth(auth())
+    assert 0 < redis_client.ttl("auth:fail:user:user_1:1m") <= 50
