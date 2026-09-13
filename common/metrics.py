@@ -55,6 +55,13 @@ detection_pipeline_latency_seconds = Histogram(
     registry=REGISTRY,
 )
 
+events_blocked_total = Counter(
+    "events_blocked_total",
+    "Events rejected by the detection engine because an enforcement rule was active",
+    ["event_type", "reason"],  # event_type: transaction | auth ; reason: quarantine | ip_block
+    registry=REGISTRY,
+)
+
 # Containment engine
 containment_actions_total = Counter(
     "containment_actions_total",

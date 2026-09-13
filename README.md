@@ -16,7 +16,7 @@ Kafka (audit-log)
 ```
 
 - **Redis**: state store (replay hashes, user sessions, burst windows, auth-fail windows, IP blocks, quarantine rules).
-- **FastAPI**: control API for health and enforcement rules.
+- **FastAPI**: control API for health, enforcement rules and manual overrides (token-protected).
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
 - **Docker Compose**: runs Kafka, Zookeeper, Redis, Prometheus, and Grafana locally.
@@ -88,7 +88,7 @@ Each component exposes Prometheus metrics:
 
 **Metrics exposed:**
 
-- `transactions_processed_total{outcome}` — transactions processed (outcome: `clean` \| `detected`; detected = any detector fired)
+- `transactions_processed_total{outcome}` — transactions processed (outcome: `clean` \| `detected` \| `blocked`; detected = any detector fired)
 - `replay_detections_total{detection_type}` — replay attacks detected
 - `geo_velocity_detections_total{detection_type}` — geo velocity (impossible travel) anomalies detected
 - `fraud_burst_detections_total{detection_type}` — fraud burst (too many transactions in rolling window) detections
@@ -100,7 +100,8 @@ Each component exposes Prometheus metrics:
 - `processing_errors_total{stage,kind}` — handler failures (`transient` = retried in place, `permanent` = dead-lettered)
 - `dlq_messages_total{stage}` — records written to `rtace-dlq`
 - `kafka_send_failures_total{topic}` — async producer sends that failed after retries
-- `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine`, `ip_block` for credential stuffing)
+- `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine` \| `step_up_auth` \| `ip_block`)
+- `events_blocked_total{event_type,reason}` — events the detection engine refused because a rule was active (`transaction`/`quarantine`, `auth`/`ip_block`); blocked transactions also appear as `transactions_processed_total{outcome="blocked"}`
 - `redis_operation_latency_seconds{operation}` — Redis call latency (e.g. `replay_check`, `setex_quarantine`, `ping`, `scan_quarantine`)
 - `detection_pipeline_latency_seconds` — time to process a transaction through the detection pipeline
 
@@ -161,6 +162,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
    - **Geo velocity detections (rate)** — `geo_velocity_detections_total`
    - **Fraud burst detections (rate)** — `fraud_burst_detections_total`
    - **Credential stuffing detections (rate, by scope)** — `credential_stuffing_detections_total` (`user` vs `ip`)
+   - **Events blocked by enforcement**, **Detections suppressed by cooldown**, **Consumer processing errors and DLQ**, **Kafka send failures**
 
 6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
 
@@ -175,7 +177,18 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 
   ```bash
   curl http://localhost:8000/health
-  curl http://localhost:8000/enforcement/rules
+  curl -H "Authorization: Bearer $RTACE_API_TOKEN" http://localhost:8000/enforcement/rules
+  ```
+
+- **Manual overrides** (require `RTACE_API_TOKEN`; each one is written to `audit-log` with `source: api`):
+
+  ```bash
+  H="Authorization: Bearer $RTACE_API_TOKEN"
+  curl -X POST   -H "$H" "http://localhost:8000/enforcement/quarantine/user_3?ttl_seconds=600&reason=fraud-desk"
+  curl -X DELETE -H "$H"  http://localhost:8000/enforcement/quarantine/user_3
+  curl -X DELETE -H "$H"  http://localhost:8000/enforcement/step-up/user_2      # user completed step-up auth
+  curl -X POST   -H "$H"  http://localhost:8000/enforcement/ip-block/203.0.113.9
+  curl -X DELETE -H "$H"  http://localhost:8000/enforcement/ip-block/203.0.113.9
   ```
 
 - **Redis quarantine keys** (user quarantined for 1 hour after replay):
@@ -239,6 +252,8 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 | `REDIS_DB` | `0` | Redis DB |
 | `REDIS_REPLAY_TTL_HOURS` | `24` | Sliding TTL of each `replay:seen:{hash}` key (hours) |
 | `REDIS_QUARANTINE_TTL_SECONDS` | `3600` | Quarantine rule TTL (1 hour) |
+| `REDIS_STEP_UP_TTL_SECONDS` | `900` | How long a geo-velocity step-up requirement stays pending (15 min) |
+| `RTACE_API_TOKEN` | unset | Bearer token for `/enforcement`. When unset, reads are open and manual overrides answer 503 |
 | `REDIS_SESSION_TTL_DAYS` | `7` | User session (last location) TTL for geo velocity (days) |
 | `SESSION_CACHE_MAXSIZE` | `10000` | Entries in the in-process (L1) session cache |
 | `SESSION_CACHE_TTL_SECONDS` | `300` | Max age of an L1 session entry before Redis is consulted again |
@@ -268,6 +283,29 @@ RTACE/
 └── README.md
 ```
 
+## Enforcement and containment policy
+
+Enforcement rules are Redis keys with TTLs, and the detection engine **checks them before analysing an event**:
+
+| Rule | Key | Effect in the detection engine |
+|------|-----|--------------------------------|
+| Quarantine | `enforce:quarantine:user:{user_id}` | Transactions from the user are refused: no detectors run, the trusted location and burst window do not advance, `events_blocked_total{transaction,quarantine}` is incremented and a `transaction_blocked` record goes to `audit-log` |
+| IP block | `block:ip:{ip}` | Login attempts from the IP are refused and do not feed the stuffing counters (`events_blocked_total{auth,ip_block}`, `auth_blocked` audit record) |
+| Step-up | `enforce:step_up:user:{user_id}` | Nothing is blocked. The key signals to the authentication layer that the user must re-authenticate; clear it with `DELETE /enforcement/step-up/{user_id}` once they have |
+
+Each key's value is the detection id (or `api:<reason>` for manual overrides), so `GET /enforcement/rules` shows who set every rule and how long it has left.
+
+**Containment policy** (containment engine, per detection type):
+
+| Detection | Signal quality | Action |
+|-----------|----------------|--------|
+| `replay_attack` | hard: an exact request was resent | quarantine user |
+| `fraud_burst` | hard: rate far above normal | quarantine user |
+| `credential_stuffing` | hard | quarantine user **and** block IP |
+| `geo_velocity_anomaly` | soft: VPNs, shared accounts and coarse geolocation trip it | **step-up auth** for `REDIS_STEP_UP_TTL_SECONDS`; if another anomaly arrives while a step-up is already pending, **escalate to quarantine** |
+
+Every action is idempotent (SETEX), so redelivered detections are harmless.
+
 ## Delivery guarantees and failure handling
 
 Both consumers share one loop (`common/consumer_loop.py`) with these rules:
@@ -295,7 +333,7 @@ Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 - Each transaction is hashed (user, amount to the cent, merchant, timestamp, location). The timestamp is part of the hash on purpose: a replay resends a captured request byte-for-byte, and excluding it would make two identical legitimate purchases on the same day a false positive.
 - Each hash gets its own key `replay:seen:{hash}` written with `SET NX EX`, so the 24h window slides per transaction. There is no day-boundary hole and unrelated writes never refresh another transaction's expiry.
 - The key's value is the Kafka record (`topic:partition:offset`) that first carried the transaction. Kafka is at-least-once: if the **same record** is delivered again after a crash, the stored value matches and it is counted in `replay_redeliveries_total`, not flagged. A real replay arrives in a **different** record → **replay_attack** (severity high) is emitted with the original record in `details.first_seen_record`.
-- Containment: key `enforce:quarantine:user:{user_id}` is set in Redis with TTL 1 hour.
+- Containment: quarantine (see **Containment policy**).
 
 **Geo velocity (impossible travel)**
 
@@ -304,7 +342,7 @@ Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 - If velocity > `GEO_MAX_VELOCITY_KMH` (default 900) → **geo_velocity_anomaly** detection (severity high) with distance, elapsed time and velocity in `details`.
 - The session is the user's last **trusted** position. It advances only on clean transactions: a flagged location never becomes the baseline (otherwise the user's next purchase from home would be flagged too), and a transaction older than the baseline (late/out-of-order delivery) is ignored rather than rewinding it. A genuine relocation is accepted once enough time has passed for the implied speed to be plausible.
 - Session hash `session:{user_id}` has a 7-day TTL and is fronted by a per-process TTL cache (`SESSION_CACHE_*`) that is cleared whenever the consumer loses Kafka partitions.
-- Containment: same quarantine as replay (`enforce:quarantine:user:{user_id}`).
+- Containment: **step-up authentication**, escalating to quarantine on a repeat (see **Containment policy**).
 
 **Fraud burst (rolling transaction rate)**
 
@@ -314,7 +352,7 @@ Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 - The sorted set key is given a **TTL** (default **120 seconds**) so it expires automatically after inactivity.
 - Metric: `fraud_burst_detections_total{detection_type}`.
 - Grafana: **Fraud burst detections (rate)** panel on the RTACE dashboard.
-- Containment: same quarantine as other high-severity detections (`enforce:quarantine:user:{user_id}`).
+- Containment: quarantine (see **Containment policy**).
 
 **Credential stuffing**
 

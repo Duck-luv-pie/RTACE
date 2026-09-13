@@ -29,6 +29,7 @@ class RedisConfig:
     auth_fail_ip_threshold: int
     auth_fail_key_ttl_seconds: int
     ip_block_ttl_seconds: int
+    step_up_ttl_seconds: int
     detection_cooldown_seconds: int
 
     @classmethod
@@ -51,5 +52,6 @@ class RedisConfig:
             auth_fail_ip_threshold=int(os.getenv("REDIS_AUTH_FAIL_IP_THRESHOLD", "50")),
             auth_fail_key_ttl_seconds=int(os.getenv("REDIS_AUTH_FAIL_KEY_TTL_SECONDS", "120")),
             ip_block_ttl_seconds=int(os.getenv("REDIS_IP_BLOCK_TTL_SECONDS", "3600")),
+            step_up_ttl_seconds=int(os.getenv("REDIS_STEP_UP_TTL_SECONDS", "900")),
             detection_cooldown_seconds=int(os.getenv("DETECTION_COOLDOWN_SECONDS", "60")),
         )

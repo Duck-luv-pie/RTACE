@@ -7,8 +7,10 @@ and a list-collecting ``emit`` callback.
 import logging
 from typing import Callable, Optional
 
+from common.enforcement import is_ip_blocked, is_user_quarantined
 from common.metrics import (
     credential_stuffing_detections_total,
+    events_blocked_total,
     fraud_burst_detections_total,
     geo_velocity_detections_total,
     replay_detections_total,
@@ -26,6 +28,7 @@ from detection_engine.replay_detector import check_replay
 logger = logging.getLogger(__name__)
 
 Emit = Callable[[DetectionEvent], None]
+EmitAudit = Callable[[dict], None]
 
 
 def record_ref(topic: str, partition: int, offset: int) -> str:
@@ -40,9 +43,11 @@ class DetectionPipeline:
         emit: Emit,
         kafka_config: Optional[KafkaConfig] = None,
         redis_config: Optional[RedisConfig] = None,
+        emit_audit: Optional[EmitAudit] = None,
     ) -> None:
         self.redis = redis_client
         self.emit = emit
+        self.emit_audit = emit_audit
         self.kafka_config = kafka_config or KafkaConfig.from_env()
         # Loaded once; every detector receives this instance instead of
         # re-reading the environment per event.
@@ -64,6 +69,9 @@ class DetectionPipeline:
     def handle_transaction(
         self, tx: TransactionEvent, ref: Optional[str] = None
     ) -> list[DetectionEvent]:
+        if is_user_quarantined(self.redis, tx.user_id):
+            self._blocked("transaction", "quarantine", tx.user_id, tx.event_id)
+            return []
         cfg = self.redis_config
         candidates = [
             check_replay(tx, self.redis, cfg, record_ref=ref),
@@ -78,8 +86,35 @@ class DetectionPipeline:
     # ----------------------------------------------------------------- auth
 
     def handle_auth(self, auth: AuthEvent) -> list[DetectionEvent]:
+        if is_ip_blocked(self.redis, auth.ip_address):
+            self._blocked("auth", "ip_block", auth.user_id, auth.event_id, ip=auth.ip_address)
+            return []
         det_user, det_ip = check_credential_stuffing(auth, self.redis, self.redis_config)
         return [d for d in (det_user, det_ip) if d is not None and self._publish(d)]
+
+    # ---------------------------------------------------------- enforcement
+
+    def _blocked(self, event_type: str, reason: str, user_id: str, event_id: str, ip: Optional[str] = None) -> None:
+        """An active rule rejects this event: it is not analysed, it is refused.
+
+        A quarantined user's transactions must not advance their trusted
+        location or burst window, and a blocked IP's login attempts must not
+        keep feeding the stuffing counters. The refusal is counted and, when an
+        audit sink is configured, recorded so enforcement is observable."""
+        events_blocked_total.labels(event_type=event_type, reason=reason).inc()
+        if event_type == "transaction":
+            transactions_processed_total.labels(outcome="blocked").inc()
+        logger.info("Blocked %s: user_id=%s event_id=%s reason=%s", event_type, user_id, event_id, reason)
+        if self.emit_audit is not None:
+            self.emit_audit(
+                {
+                    "event": f"{event_type}_blocked",
+                    "reason": reason,
+                    "user_id": user_id,
+                    "event_id": event_id,
+                    "ip_address": ip,
+                }
+            )
 
     # -------------------------------------------------------------- publish
 

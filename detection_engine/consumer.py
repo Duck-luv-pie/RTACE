@@ -71,7 +71,12 @@ def run_detection_engine() -> None:
             key=detection.user_id,
         )
 
-    pipeline = DetectionPipeline(redis_client, emit, kafka_config, redis_config)
+    def emit_audit(audit: dict) -> None:
+        send_message(producer, kafka_config.audit_log_topic, audit, key=audit["user_id"])
+
+    pipeline = DetectionPipeline(
+        redis_client, emit, kafka_config, redis_config, emit_audit=emit_audit
+    )
 
     def handle(topic: str, partition: int, offset: int, value) -> None:
         start = time.perf_counter()
