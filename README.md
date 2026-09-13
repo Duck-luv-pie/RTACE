@@ -99,7 +99,18 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite runs against an in-memory Redis (`fakeredis`) and fake Kafka consumers, so it needs no infrastructure. It covers every detector, the cooldown, the session cache, the consumer loop (commit / retry / DLQ / shutdown), containment policy, enforcement, the API and the simulator.
+The default suite runs against an in-memory Redis (`fakeredis`) and fake Kafka consumers, so it needs no infrastructure. It covers every detector, the cooldown, the consumer loop (commit / retry / DLQ / flush-before-commit durability / shutdown), containment policy, enforcement, the API and the simulator. Set `RTACE_TEST_REDIS_URL` to run the same suite against a real Redis (real Lua interpreter).
+
+Live end-to-end tests live in `tests/integration/` and are skipped unless you point them at running infrastructure:
+
+```bash
+docker compose -f deployment/docker-compose.yml up -d          # Kafka + Redis
+RTACE_INTEGRATION=1 KAFKA_BOOTSTRAP_SERVERS=localhost:9092 REDIS_HOST=localhost \
+  RTACE_DECISION_URL=http://localhost:8090/v1/decide \
+  pytest tests/integration -v
+```
+
+They create unique per-run topics and use a dedicated Redis DB, so a running stack is undisturbed. They exercise the real consumer loop, real Kafka round trips, the real Lua scripts in real Redis (replay + burst detected, a quarantined user blocked), and the Go decision service over HTTP (allow, cached retry, replay deny).
 
 ### Running without Docker (Homebrew on macOS)
 
