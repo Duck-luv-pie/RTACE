@@ -1,38 +1,40 @@
-# RTACE local stack: Kafka + Zookeeper + Redis
-# Run from repo root: docker compose -f deployment/docker-compose.yml up -d
-
-version: "3.8"
+# RTACE local stack.
+#
+#   Infrastructure only (run the Python services on the host):
+#     docker compose -f deployment/docker-compose.yml up -d
+#
+#   Everything in containers (infrastructure + detection, containment, API, simulator):
+#     docker compose -f deployment/docker-compose.yml --profile app up -d --build
+#
+# Kafka runs in KRaft mode (no ZooKeeper). Data for Kafka, Redis, Prometheus and
+# Grafana lives in named volumes and survives `docker compose down`; use
+# `down -v` to wipe it.
 
 services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "2181"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
-    depends_on:
-      zookeeper:
-        condition: service_healthy
     ports:
       - "9092:9092"
-      - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # --- KRaft single node: this broker is also the controller
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # --- Listeners: 29092 for containers, 9092 for the host, 29093 controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # --- Single-broker replication settings
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      # Tuning for high-throughput ingestion
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # --- Throughput tuning
       KAFKA_NUM_NETWORK_THREADS: 4
       KAFKA_NUM_IO_THREADS: 8
       KAFKA_SOCKET_SEND_BUFFER_BYTES: 1048576
@@ -40,11 +42,14 @@ services:
       KAFKA_MESSAGE_MAX_BYTES: 1048576
       KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 10000
       KAFKA_LOG_FLUSH_INTERVAL_MS: 1000
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 20s
 
   # Creates all topics with 16 partitions so multiple consumer processes can
   # run in parallel within the same consumer group (one partition per process).
@@ -70,13 +75,21 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    # noeviction, not allkeys-lru: this Redis holds enforcement rules and
+    # replay state. Under memory pressure it must refuse writes (the consumers
+    # treat OOM as transient and stall visibly) rather than silently evict a
+    # quarantine or a replay key. appendonly persists rules across restarts.
     command: >
       redis-server
       --maxmemory 2gb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
       --hz 20
       --tcp-backlog 511
       --tcp-keepalive 60
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -93,6 +106,7 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -102,7 +116,7 @@ services:
       - "3000:3000"
     environment:
       GF_INSTALL_PLUGINS: ""
-      # Use env vars so real credentials are never committed. Defaults: admin / admin.
+      # Set GRAFANA_ADMIN_* in deployment/.env (see .env.example). Defaults: admin / admin.
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
@@ -111,5 +125,73 @@ services:
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
+
+  # ---------------------------------------------------------------- app profile
+  # Python services, built from ../Dockerfile. Started only with --profile app.
+
+  detection-engine:
+    build: { context: .., dockerfile: Dockerfile }
+    image: rtace:local
+    profiles: [app]
+    command: ["python", "-m", "detection_engine.consumer"]
+    environment: &app-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      RTACE_API_TOKEN: ${RTACE_API_TOKEN:-}
+    ports:
+      - "9091:9091"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  containment-engine:
+    image: rtace:local
+    profiles: [app]
+    command: ["python", "-m", "containment_engine.consumer"]
+    environment: *app-env
+    ports:
+      - "9093:9093"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    image: rtace:local
+    profiles: [app]
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  simulator:
+    image: rtace:local
+    profiles: [app]
+    command: ["python", "-m", "simulator.transaction_simulator"]
+    environment:
+      <<: *app-env
+      SIM_INTERVAL_SECONDS: ${SIM_INTERVAL_SECONDS:-0.5}
+    depends_on:
+      detection-engine:
+        condition: service_started
+      containment-engine:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

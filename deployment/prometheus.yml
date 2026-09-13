@@ -1,7 +1,9 @@
-# Minimal Prometheus config for RTACE local development.
-# Scrapes detection engine (9091), containment engine (9093), and API (8000).
-# When running Python components on the host, use host.docker.internal so
-# Prometheus in Docker can reach them.
+# Prometheus config for RTACE local development.
+#
+# Two target sets are listed for each service: host.docker.internal:<port> for
+# when the Python services run on the host, and the compose service name for
+# when they run under `--profile app`. Whichever is not running simply shows
+# as DOWN on the Targets page.
 
 global:
   scrape_interval: 15s
@@ -9,16 +11,25 @@ global:
 
 scrape_configs:
   - job_name: "rtace-detection-engine"
+    metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9091"]
-    metrics_path: /metrics
+        labels: { runtime: host }
+      - targets: ["detection-engine:9091"]
+        labels: { runtime: compose }
 
   - job_name: "rtace-containment-engine"
+    metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9093"]
-    metrics_path: /metrics
+        labels: { runtime: host }
+      - targets: ["containment-engine:9093"]
+        labels: { runtime: compose }
 
   - job_name: "rtace-api"
+    metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:8000"]
-    metrics_path: /metrics
+        labels: { runtime: host }
+      - targets: ["api:8000"]
+        labels: { runtime: compose }

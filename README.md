@@ -1,30 +1,34 @@
 # RTACE — Real-Time Transaction Anomaly & Containment Engine
 
-A real-time fraud detection pipeline that ingests transaction streams, detects threats (starting with **replay attacks**), and performs automated containment actions.
+A real-time fraud detection pipeline that ingests transaction and login streams, detects replay attacks, impossible travel, transaction bursts and credential stuffing, applies tiered containment, and **enforces** the resulting rules on subsequent traffic.
+
+[![CI](https://github.com/Duck-luv-pie/RTACE/actions/workflows/ci.yml/badge.svg)](https://github.com/Duck-luv-pie/RTACE/actions/workflows/ci.yml)
 
 ## Architecture
 
 ```
-Transaction Simulator  →  Kafka (tx-events)   ─┐
-                       →  Kafka (auth-events) ─┼→  Detection Engine
-                                                      ↓
-                                              Kafka (detections)
-                                                      ↓
-Containment Engine  ←  Redis (enforcement rules)  ←  Kafka (detections)
-       ↓
-Kafka (audit-log)
+Simulator ─► Kafka tx-events   ──┐
+          ─► Kafka auth-events ──┼─► Detection Engine ──► Kafka detections ──► Containment Engine
+                                 │     │        ▲                                   │
+                                 │     │        │ reads rules                       │ writes rules
+                                 │     ▼        │                                   ▼
+                                 │   blocks ◄── Redis (enforcement: quarantine / step-up / ip block)
+                                 │                Redis (state: replay keys, sessions, windows, cooldowns)
+                                 │
+                                 └─► poison records ──► Kafka rtace-dlq
+   Detection + Containment + API ──► Kafka audit-log        Control API ◄──► Redis (list / override rules)
 ```
 
-- **Redis**: state store (replay hashes, user sessions, burst windows, auth-fail windows, IP blocks, quarantine rules).
+- **Redis**: state store (replay keys, user sessions, burst and auth-fail windows, cooldowns) **and** enforcement store (quarantines, step-ups, IP blocks). Runs with `noeviction` + AOF so a rule is never silently dropped.
 - **FastAPI**: control API for health, enforcement rules and manual overrides (token-protected).
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
-- **Docker Compose**: runs Kafka, Zookeeper, Redis, Prometheus, and Grafana locally.
+- **Docker Compose**: runs Kafka (KRaft, no ZooKeeper), Redis, Prometheus and Grafana locally, with persistent volumes; `--profile app` also builds and runs the four Python services.
 
 ## Prerequisites
 
-- Python 3.11+
 - Docker and Docker Compose
+- Python 3.11, 3.12 or 3.13 (only if you run the services on the host; CI tests all three)
 
 ## Quick Start
 
@@ -36,7 +40,14 @@ From the repository root:
 docker compose -f deployment/docker-compose.yml up -d
 ```
 
-Wait until Kafka is healthy (e.g. 30–60 seconds). The `kafka-init` service creates the `tx-events`, `auth-events`, `detections`, and `audit-log` topics automatically (16 partitions each, so multiple consumer processes can run in parallel), plus the `rtace-dlq` dead-letter topic.
+Wait until Kafka is healthy (20–40 seconds; `docker compose -f deployment/docker-compose.yml ps` shows `healthy`). The `kafka-init` service creates the `tx-events`, `auth-events`, `detections`, and `audit-log` topics automatically (16 partitions each, so multiple consumer processes can run in parallel), plus the `rtace-dlq` dead-letter topic.
+
+**Alternative: run everything in containers.** Skip steps 2 and 3 entirely:
+
+```bash
+docker compose -f deployment/docker-compose.yml --profile app up -d --build
+docker compose -f deployment/docker-compose.yml logs -f detection-engine containment-engine simulator
+```
 
 ### 2. Install Python dependencies
 
@@ -62,10 +73,11 @@ PYTHONPATH=. python -m detection_engine.consumer
 PYTHONPATH=. python -m containment_engine.consumer
 ```
 
-**Terminal 3 — Simulator** (produces **transaction** events to `tx-events` and **authentication** events to `auth-events`, with optional transaction replays and occasional failed-login bursts):
+**Terminal 3 — Simulator** (produces **transaction** events to `tx-events` and **authentication** events to `auth-events`, with tagged attack scenarios; see **Simulator**):
 
 ```bash
-PYTHONPATH=. python -m simulator.transaction_simulator
+PYTHONPATH=. python -m simulator.transaction_simulator            # defaults
+PYTHONPATH=. python -m simulator.transaction_simulator --help     # all knobs
 ```
 
 **Terminal 4 — Control API** (optional):
@@ -74,7 +86,16 @@ PYTHONPATH=. python -m simulator.transaction_simulator
 PYTHONPATH=. uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Order: start **detection** and **containment** first, then the **simulator**. The simulator will send transactions; some are replayed on purpose (`replay_probability=0.2`), so you should see replay detections and quarantine rules in logs and Redis.
+Order: start **detection** and **containment** first, then the **simulator**. Within a minute or two you should see `scenario=` lines in the simulator, matching detections in the detection engine, `Containment applied` lines in the containment engine, and `Blocked transaction` lines once quarantined users keep sending.
+
+### 4. Run the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite runs against an in-memory Redis (`fakeredis`) and fake Kafka consumers, so it needs no infrastructure. It covers every detector, the cooldown, the session cache, the consumer loop (commit / retry / DLQ / shutdown), containment policy, enforcement, the API and the simulator.
 
 ## Prometheus metrics
 
@@ -272,14 +293,16 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 
 ```
 RTACE/
-├── simulator/           # Transaction + auth event generator (tx-events, auth-events)
-├── detection_engine/    # Detectors + pipeline; consumes tx-events + auth-events → detections
-├── tests/               # pytest suite (fakeredis-backed, no Kafka needed)
-├── containment_engine/ # Detections → Redis rules + audit-log
-├── api/                 # FastAPI control API
-├── common/              # Models, Kafka/Redis clients, shared consumer loop, metrics
-├── configs/             # Kafka and Redis config
-├── deployment/          # docker-compose.yml, prometheus.yml, grafana/provisioning
+├── simulator/           # Traffic generator with tagged attack scenarios (tx-events, auth-events)
+├── detection_engine/    # Detectors, cooldown, DetectionPipeline; tx-events + auth-events → detections
+├── containment_engine/  # ContainmentPipeline + policy; detections → Redis rules + audit-log
+├── api/                 # FastAPI control API (rules, manual overrides, health, metrics)
+├── common/              # Models, Kafka/Redis clients, consumer loop, enforcement reads, metrics
+├── configs/             # Kafka and Redis/detector config (all env-driven)
+├── tests/               # pytest suite (fakeredis + fake consumers; no infrastructure needed)
+├── deployment/          # docker-compose.yml (KRaft Kafka, Redis, Prometheus, Grafana, app profile)
+├── Dockerfile           # One image for all four Python services
+├── .github/workflows/   # CI: import check + tests on Python 3.11 / 3.12 / 3.13
 └── README.md
 ```
 
@@ -321,9 +344,25 @@ Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 - **Graceful shutdown.** SIGINT/SIGTERM finish the current batch (or abandon a record mid-retry without committing it), commit, flush the producer and close both clients.
 - **Producer durability.** Producers use `acks=all` with the idempotent producer, so a retried batch cannot duplicate or reorder records within a partition, and send failures are counted in `kafka_send_failures_total`.
 
+## Simulator
+
+Each simulated user has a **home city**; nearly all of their transactions come from there, so geo velocity sees realistic traffic. Attacks are injected on top and logged with a `scenario=` tag:
+
+| Scenario | What is sent | Default schedule | Detector it exercises |
+|----------|--------------|------------------|-----------------------|
+| `replay` | a user's previous transaction, byte-for-byte | 5% of iterations | replay |
+| `impossible_travel` | one transaction from a city far from home | 2% of iterations | geo velocity |
+| `fraud_burst` | 25 transactions for one user in a few seconds | every 200 iterations | fraud burst (threshold 20) |
+| `stuffing_user` | 12 failed logins against one account | every 150 iterations | credential stuffing (user) |
+| `stuffing_ip` | 52 failed logins from one IP across accounts | every 400 iterations | credential stuffing (IP) |
+
+Quarantined users keep sending, which is what an attacker does, so you also see enforcement working (`Blocked transaction` in the detection engine, `events_blocked_total` in Grafana).
+
+Knobs, as environment variables or flags (flags win): `SIM_INTERVAL_SECONDS` / `--interval` (default 0.5), `SIM_USERS` / `--users` (20), `SIM_REPLAY_PROBABILITY` / `--replay-p`, `SIM_IMPOSSIBLE_TRAVEL_PROBABILITY` / `--travel-p`, `SIM_AUTH_FAIL_PROBABILITY` / `--auth-fail-p`, `SIM_BURST_EVERY` / `--burst-every`, `SIM_STUFFING_USER_EVERY`, `SIM_STUFFING_IP_EVERY` (0 disables a scenario), `SIM_SEED` / `--seed` for a reproducible stream.
+
 ## Event types
 
-- **Transaction events** (`tx-events`): same schema as before (`user_id`, `amount`, `merchant`, `location`, `latitude` / `longitude`, etc.).
+- **Transaction events** (`tx-events`): `event_id`, `user_id`, `amount`, `merchant`, `timestamp`, `location`, `latitude`, `longitude`.
 - **Authentication events** (`auth-events`): `event_id`, `user_id`, `ip_address`, `success` (boolean), `timestamp`. Used for credential stuffing detection only (failed attempts).
 
 ## Detection modules
