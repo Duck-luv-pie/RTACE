@@ -152,6 +152,7 @@ services:
 
   containment-engine:
     image: rtace:local
+    pull_policy: never  # built by detection-engine above; never try the registry
     profiles: [app]
     command: ["python", "-m", "containment_engine.consumer"]
     environment: *app-env
@@ -166,6 +167,7 @@ services:
 
   api:
     image: rtace:local
+    pull_policy: never  # built by detection-engine above; never try the registry
     profiles: [app]
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment: *app-env
@@ -178,6 +180,7 @@ services:
 
   simulator:
     image: rtace:local
+    pull_policy: never  # built by detection-engine above; never try the registry
     profiles: [app]
     command: ["python", "-m", "simulator.transaction_simulator"]
     environment:
