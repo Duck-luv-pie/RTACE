@@ -226,6 +226,8 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 
 6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
 
+If you edit `deployment/prometheus.yml` while the stack is running, Prometheus does not pick it up on its own: run `curl -X POST localhost:9090/-/reload` (lifecycle API is enabled) or `docker compose -f deployment/docker-compose.yml restart prometheus`.
+
 **Provisioning layout**
 
 - Data source: `deployment/grafana/provisioning/datasources/datasources.yml`
