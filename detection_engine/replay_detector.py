@@ -1,50 +1,61 @@
-"""Replay attack detection: same transaction hash seen within the last 24 hours."""
+"""Replay attack detection: the same transaction hash seen again within the replay window."""
 
 from datetime import datetime, timezone
 from typing import Optional
 
-from common.metrics import observe_redis_latency
-from common.models import TransactionEvent, DetectionEvent
-from common.redis_client import create_redis_client
+from common.metrics import observe_redis_latency, replay_redeliveries_total
+from common.models import DetectionEvent, TransactionEvent, new_detection_id
 from configs.redis_config import RedisConfig
 
 REDIS_KEY_PREFIX = "replay:seen:"
 
 
-def _date_key() -> str:
-    """Key suffix by date so we can expire per-day (e.g. replay:seen:2025-03-08)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _key(tx_hash: str) -> str:
+    return f"{REDIS_KEY_PREFIX}{tx_hash}"
 
 
 def check_replay(
     tx: TransactionEvent,
     redis_client,
     redis_config: Optional[RedisConfig] = None,
+    record_ref: Optional[str] = None,
 ) -> Optional[DetectionEvent]:
-    """
-    Check if this transaction is a replay (hash already seen in Redis within 24h).
-    If not seen, add hash to Redis and return None.
-    If seen, return a DetectionEvent.
+    """Return a replay_attack detection if this exact transaction was already seen.
+
+    State: one Redis key per transaction hash, ``replay:seen:{hash}``, set with
+    ``NX`` and a sliding TTL of ``replay_ttl_hours``. A per-key TTL has no
+    day-boundary hole (a replay at 00:01 of something first seen at 23:59 is
+    still caught) and does not get its expiry refreshed by unrelated writes.
+
+    The key's value is ``record_ref``: an identifier of the Kafka record that
+    first carried this transaction (``topic:partition:offset``). Kafka is
+    at-least-once, so after a crash the same record can be delivered again. A
+    redelivered record hits an existing key whose value equals its own
+    ``record_ref`` and is *not* a replay; a real replay arrives in a different
+    record and its ``record_ref`` differs. Callers without Kafka coordinates may
+    pass ``None``, in which case every repeat counts as a replay.
     """
     config = redis_config or RedisConfig.from_env()
-    key = f"{REDIS_KEY_PREFIX}{_date_key()}"
-    tx_hash = tx.replay_hash()
+    key = _key(tx.replay_hash())
+    ttl_seconds = config.replay_ttl_hours * 3600
+    value = record_ref or tx.event_id
 
     with observe_redis_latency("replay_check"):
-        with redis_client.pipeline(transaction=False) as pipe:
-            pipe.sadd(key, tx_hash)
-            pipe.expire(key, config.replay_ttl_hours * 3600)
-            added, _ = pipe.execute()
+        first_seen = redis_client.set(key, value, nx=True, ex=ttl_seconds)
+        if first_seen:
+            return None
+        stored = redis_client.get(key)
 
-    if added:
+    if record_ref is not None and stored == record_ref:
+        replay_redeliveries_total.inc()
         return None
 
-    # Already in set → replay
     return DetectionEvent(
-        detection_id=f"det-{tx.event_id}",
+        detection_id=new_detection_id("replay"),
         detection_type="replay_attack",
         severity="high",
         user_id=tx.user_id,
         transaction_id=tx.event_id,
         timestamp=datetime.now(timezone.utc),
+        details={"first_seen_record": stored},
     )

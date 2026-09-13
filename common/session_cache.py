@@ -1,24 +1,39 @@
-"""Two-level session cache: L1 in-process LRU, L2 Redis.
+"""Two-level session cache: L1 in-process TTL/LRU cache, L2 Redis.
 
-Read path:  check LRU cache first; on miss, fetch from Redis and populate L1.
+Read path:  check the in-process cache first; on miss, fetch from Redis and populate L1.
 Write path: write-through — update L1 immediately, then persist to Redis.
 
-Sizing rationale: 10,000 entries × ~250 bytes each ≈ 2.5 MB resident memory,
-which eliminates one Redis round-trip per transaction for any user seen in the
-recent working set — the dominant cost in the geo-velocity detection hot path.
+Why a TTL and not a plain LRU: the L1 copy is private to this process. Kafka
+partitions are keyed by user_id, so at any instant only one consumer process
+sees a given user, but after a rebalance a partition can move away and come
+back, at which point the old process must not serve a location it cached
+before the partition left. Bounding L1 entries with a short TTL (and clearing
+the cache on partition revocation, see ``clear()``) keeps that staleness window
+small. The TTL also keeps L1 from outliving the 7-day Redis session TTL.
 """
 
 from datetime import datetime
 from typing import Any, Optional
 
-from cachetools import LRUCache
+from cachetools import TTLCache
 
 from common.metrics import observe_redis_latency, session_cache_requests_total
 
-_SESSION_MAXSIZE = 10_000
+_DEFAULT_MAXSIZE = 10_000
+_DEFAULT_TTL_SECONDS = 300
 
-# Module-level singleton — shared across all calls within this process.
-_cache: LRUCache = LRUCache(maxsize=_SESSION_MAXSIZE)
+_cache: TTLCache = TTLCache(maxsize=_DEFAULT_MAXSIZE, ttl=_DEFAULT_TTL_SECONDS)
+
+
+def configure(maxsize: int, ttl_seconds: int) -> None:
+    """(Re)create the L1 cache with the given bounds. Call once at process start."""
+    global _cache
+    _cache = TTLCache(maxsize=maxsize, ttl=ttl_seconds)
+
+
+def clear() -> None:
+    """Drop every L1 entry. Call when this process loses Kafka partitions."""
+    _cache.clear()
 
 
 def get_session(redis_client, user_id: str) -> Optional[dict[str, Any]]:
@@ -55,7 +70,7 @@ def set_session(
     timestamp: datetime,
     ttl_seconds: int,
 ) -> None:
-    """Write-through: update L1 immediately, then persist to Redis."""
+    """Write-through: update L1 immediately, then persist to Redis in one round trip."""
     entry = {
         "last_latitude": latitude,
         "last_longitude": longitude,
@@ -65,12 +80,14 @@ def set_session(
 
     key = f"session:{user_id}"
     with observe_redis_latency("session_set"):
-        redis_client.hset(
-            key,
-            mapping={
-                "last_latitude": str(latitude),
-                "last_longitude": str(longitude),
-                "last_timestamp": timestamp.isoformat(),
-            },
-        )
-        redis_client.expire(key, ttl_seconds)
+        with redis_client.pipeline(transaction=False) as pipe:
+            pipe.hset(
+                key,
+                mapping={
+                    "last_latitude": str(latitude),
+                    "last_longitude": str(longitude),
+                    "last_timestamp": timestamp.isoformat(),
+                },
+            )
+            pipe.expire(key, ttl_seconds)
+            pipe.execute()

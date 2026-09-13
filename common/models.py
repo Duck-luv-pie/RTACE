@@ -1,10 +1,18 @@
 """Shared Pydantic models for RTACE."""
 
 import hashlib
+import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+
+def new_detection_id(prefix: str) -> str:
+    """Globally unique detection id. Detection ids must never be derived from the
+    triggering event id alone: the same event can legitimately produce several
+    detections (a replayed transaction replayed again, a burst that keeps going)."""
+    return f"det-{prefix}-{uuid.uuid4()}"
 
 
 class TransactionEvent(BaseModel):
@@ -20,13 +28,18 @@ class TransactionEvent(BaseModel):
     longitude: float
 
     def replay_hash(self) -> str:
+        """Stable hash identifying this exact request for replay detection.
+
+        The timestamp is deliberately part of the hash. A replay attack resends
+        a captured request byte-for-byte, timestamp included; a request whose
+        timestamp differs is a *new* request as far as the upstream signature is
+        concerned. Dropping the timestamp would turn two legitimate identical
+        purchases on the same day into a false positive.
         """
-        Stable hash for replay detection (same payload = same hash).
-        MVP: uses location string and includes timestamp. Future: canonical field set,
-        normalized location representation, and consider excluding timestamp if replay
-        is defined as "same logical request resent".
-        """
-        payload = f"{self.user_id}|{self.amount}|{self.merchant}|{self.timestamp.isoformat()}|{self.location}"
+        payload = (
+            f"{self.user_id}|{self.amount:.2f}|{self.merchant}|"
+            f"{self.timestamp.isoformat()}|{self.location}"
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -52,4 +65,8 @@ class DetectionEvent(BaseModel):
     ip_address: Optional[str] = Field(
         default=None,
         description="Source IP when relevant (e.g. credential stuffing)",
+    )
+    details: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Detector-specific evidence (velocity, counts, scope, ...)",
     )

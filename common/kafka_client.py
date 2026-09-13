@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Optional, Union
 
-from kafka import KafkaProducer, KafkaConsumer
+from kafka import ConsumerRebalanceListener, KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
 from configs.kafka_config import KafkaConfig
@@ -44,8 +44,12 @@ def create_consumer(
     topic: Union[str, list[str]],
     group_id: str,
     config: Optional[KafkaConfig] = None,
+    rebalance_listener: Optional[ConsumerRebalanceListener] = None,
 ) -> KafkaConsumer:
     """Create a Kafka consumer for one or more topics.
+
+    rebalance_listener: optional ConsumerRebalanceListener notified when this
+    process gains or loses partitions (used to drop per-process caches).
 
     max_poll_records: pull up to 500 messages per poll instead of the default
     500 (already the default in newer kafka-python, explicit here for clarity).
@@ -55,8 +59,7 @@ def create_consumer(
     """
     cfg = config or KafkaConfig.from_env()
     topics = [topic] if isinstance(topic, str) else topic
-    return KafkaConsumer(
-        *topics,
+    consumer = KafkaConsumer(
         bootstrap_servers=cfg.bootstrap_servers,
         group_id=group_id,
         auto_offset_reset="earliest",
@@ -66,6 +69,8 @@ def create_consumer(
         fetch_min_bytes=65_536,
         fetch_max_wait_ms=100,
     )
+    consumer.subscribe(topics, listener=rebalance_listener)
+    return consumer
 
 
 def send_message(

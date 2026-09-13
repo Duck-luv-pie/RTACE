@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from common.metrics import observe_redis_latency
-from common.models import TransactionEvent, DetectionEvent
+from common.models import DetectionEvent, TransactionEvent, new_detection_id
 from configs.redis_config import RedisConfig
 
 BURST_KEY_PREFIX = "burst:"
@@ -21,9 +21,10 @@ def check_fraud_burst(
     redis_config: Optional[RedisConfig] = None,
 ) -> Optional[DetectionEvent]:
     """
-    Track transactions per user in a Redis sorted set (score = unix timestamp).
-    After trimming entries older than the rolling window and adding this transaction,
-    if the count exceeds the configured threshold, emit fraud_burst detection.
+    Track transactions per user in a Redis sorted set (member = event_id,
+    score = unix timestamp). Trim entries older than the rolling window, add
+    this transaction, and emit fraud_burst if the count exceeds the threshold.
+    Using event_id as the member makes redelivery of the same record idempotent.
     """
     config = redis_config or RedisConfig.from_env()
     key = _burst_key(tx.user_id)
@@ -40,11 +41,16 @@ def check_fraud_burst(
 
     if count > config.burst_threshold:
         return DetectionEvent(
-            detection_id=f"det-burst-{tx.event_id}",
+            detection_id=new_detection_id("burst"),
             detection_type="fraud_burst",
             severity="high",
             user_id=tx.user_id,
             transaction_id=tx.event_id,
             timestamp=datetime.now(timezone.utc),
+            details={
+                "count_in_window": count,
+                "window_seconds": config.burst_window_seconds,
+                "threshold": config.burst_threshold,
+            },
         )
     return None

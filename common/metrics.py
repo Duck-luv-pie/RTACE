@@ -37,6 +37,17 @@ credential_stuffing_detections_total = Counter(
     ["scope"],  # user | ip
     registry=REGISTRY,
 )
+replay_redeliveries_total = Counter(
+    "replay_redeliveries_total",
+    "Transactions whose replay key was already set by the same Kafka record (at-least-once redelivery, not a replay)",
+    registry=REGISTRY,
+)
+detections_suppressed_total = Counter(
+    "detections_suppressed_total",
+    "Detections dropped because an identical (type, subject) detection fired within the cooldown window",
+    ["detection_type"],
+    registry=REGISTRY,
+)
 detection_pipeline_latency_seconds = Histogram(
     "detection_pipeline_latency_seconds",
     "Time to process a transaction through the detection pipeline",
