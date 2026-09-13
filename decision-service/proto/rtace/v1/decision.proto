@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package rtace.v1;
+
+option go_package = "github.com/Duck-luv-pie/RTACE/decision-service/gen/rtace/v1;rtacev1";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// Synchronous fraud decision for a transaction that is about to be authorised.
+// Answers in a few milliseconds using the same Redis state and Lua checks as
+// the asynchronous detection engine.
+service DecisionService {
+  rpc Decide(DecideRequest) returns (DecideResponse);
+}
+
+// Same fields as the tx-events Kafka record, plus the caller's IP when known.
+message Transaction {
+  string event_id = 1;
+  string user_id = 2;
+  double amount = 3;
+  string merchant = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  string location = 6;
+  double latitude = 7;
+  double longitude = 8;
+  string ip_address = 9;
+}
+
+message DecideRequest {
+  Transaction transaction = 1;
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  ALLOW = 1;      // proceed
+  CHALLENGE = 2;  // require step-up authentication, then retry with the same event_id
+  DENY = 3;       // reject
+}
+
+message Reason {
+  string type = 1;                      // replay_attack | fraud_burst | geo_velocity_anomaly | user_quarantined | ip_blocked | step_up_pending
+  int32 score = 2;                      // contribution to the risk score (0-100)
+  google.protobuf.Struct details = 3;   // detector evidence, same shape as DetectionEvent.details
+}
+
+message DecideResponse {
+  string decision_id = 1;
+  Verdict verdict = 2;
+  int32 score = 3;                      // 0-100
+  repeated Reason reasons = 4;
+  bool cached = 5;                      // a retry of an event already decided returned the stored verdict
+  google.protobuf.Timestamp decided_at = 6;
+}

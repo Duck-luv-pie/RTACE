@@ -27,6 +27,14 @@ scrape_configs:
       - targets: ["containment-engine:9094"]
         labels: { runtime: compose }
 
+  - job_name: "rtace-decision-service"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8090"]
+        labels: { runtime: host }
+      - targets: ["decision-service:8090"]
+        labels: { runtime: compose }
+
   - job_name: "rtace-api"
     metrics_path: /metrics
     static_configs:

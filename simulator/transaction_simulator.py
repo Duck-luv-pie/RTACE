@@ -22,11 +22,15 @@ and exercises enforcement: those transactions show up as blocked.
 """
 
 import argparse
+import json
 import logging
 import os
 import random
 import time
+import urllib.error
+import urllib.request
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator, Optional, Union
@@ -72,7 +76,7 @@ STUFFING_IP_FAILS = 52
 @dataclass
 class SimulatorSettings:
     interval_seconds: float = 0.5
-    num_users: int = 20
+    num_users: int = 100
     replay_probability: float = 0.05
     impossible_travel_probability: float = 0.02
     auth_fail_probability: float = 0.10
@@ -80,6 +84,7 @@ class SimulatorSettings:
     stuffing_user_every: int = 150  # iterations between account-targeted stuffing (0 = never)
     stuffing_ip_every: int = 400    # iterations between IP-targeted stuffing (0 = never)
     seed: Optional[int] = None
+    decision_url: Optional[str] = None  # POST each transaction here first (decision service)
 
     @classmethod
     def from_env(cls) -> "SimulatorSettings":
@@ -96,6 +101,7 @@ class SimulatorSettings:
             stuffing_user_every=int(os.getenv("SIM_STUFFING_USER_EVERY", d.stuffing_user_every)),
             stuffing_ip_every=int(os.getenv("SIM_STUFFING_IP_EVERY", d.stuffing_ip_every)),
             seed=int(os.environ["SIM_SEED"]) if os.getenv("SIM_SEED") else None,
+            decision_url=os.getenv("SIM_DECISION_URL") or None,
         )
 
 
@@ -189,6 +195,21 @@ def generate_events(settings: SimulatorSettings, rng: Optional[random.Random] = 
         yield Emitted(None, "__sleep__")  # type: ignore[arg-type]  # pacing marker
 
 
+def ask_decision(url: str, tx: TransactionEvent, timeout: float = 2.0) -> Optional[dict]:
+    """Synchronous authorisation call, as a payment system would make before approving.
+
+    Returns the decision dict, or None if the service could not be reached
+    (the transaction is still published so the asynchronous path sees it)."""
+    body = json.dumps({"transaction": tx.model_dump(mode="json")}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        logger.warning("decision service unavailable (%s); publishing without a verdict", e)
+        return None
+
+
 def run_simulator(settings: Optional[SimulatorSettings] = None) -> None:
     settings = settings or SimulatorSettings.from_env()
     config = KafkaConfig.from_env()
@@ -196,6 +217,7 @@ def run_simulator(settings: Optional[SimulatorSettings] = None) -> None:
     logger.info("Starting simulator → %s + %s with %s", config.tx_events_topic, config.auth_events_topic, settings)
 
     sent = 0
+    verdicts: Counter = Counter()
     try:
         for item in generate_events(settings):
             if item.scenario == "__sleep__":
@@ -203,6 +225,18 @@ def run_simulator(settings: Optional[SimulatorSettings] = None) -> None:
                 continue
             ev = item.event
             if isinstance(ev, TransactionEvent):
+                if settings.decision_url:
+                    decision = ask_decision(settings.decision_url, ev)
+                    verdict = decision.get("verdict", "?") if decision else "UNAVAILABLE"
+                    verdicts[verdict] += 1
+                    if verdict not in ("ALLOW", "UNAVAILABLE"):
+                        logger.info(
+                            "decision=%s score=%s user_id=%s event_id=%s reasons=%s scenario=%s",
+                            verdict, decision.get("score"), ev.user_id, ev.event_id,
+                            [r.get("type") for r in decision.get("reasons", [])], item.scenario,
+                        )
+                    if sum(verdicts.values()) % 200 == 0:
+                        logger.info("decision verdicts so far: %s", dict(verdicts))
                 send_message(producer, config.tx_events_topic, ev.model_dump(mode="json"), key=ev.user_id)
             else:
                 send_message(producer, config.auth_events_topic, ev.model_dump(mode="json"), key=ev.user_id)
@@ -236,6 +270,7 @@ def _parse_args(argv=None) -> SimulatorSettings:
     p.add_argument("--stuffing-user-every", type=int, default=env.stuffing_user_every, help="0 disables")
     p.add_argument("--stuffing-ip-every", type=int, default=env.stuffing_ip_every, help="0 disables")
     p.add_argument("--seed", type=int, default=env.seed)
+    p.add_argument("--decision-url", default=env.decision_url, help="e.g. http://localhost:8090/v1/decide; unset = don't ask")
     a = p.parse_args(argv)
     return SimulatorSettings(
         interval_seconds=a.interval,
@@ -247,6 +282,7 @@ def _parse_args(argv=None) -> SimulatorSettings:
         stuffing_user_every=a.stuffing_user_every,
         stuffing_ip_every=a.stuffing_ip_every,
         seed=a.seed,
+        decision_url=a.decision_url or None,
     )
 
 

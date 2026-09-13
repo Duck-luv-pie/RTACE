@@ -178,6 +178,21 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Go synchronous decision service (gRPC :9095, HTTP+metrics :8090).
+  decision-service:
+    build: { context: .., dockerfile: decision-service/Dockerfile }
+    image: rtace-decision:local
+    profiles: [app]
+    environment:
+      REDIS_ADDR: redis:6379
+    ports:
+      - "9095:9095"
+      - "8090:8090"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   simulator:
     image: rtace:local
     pull_policy: never  # built by detection-engine above; never try the registry
@@ -186,10 +201,15 @@ services:
     environment:
       <<: *app-env
       SIM_INTERVAL_SECONDS: ${SIM_INTERVAL_SECONDS:-0.5}
+      # Ask the decision service before publishing each transaction, like a
+      # payment authoriser would. Unset to publish without asking.
+      SIM_DECISION_URL: ${SIM_DECISION_URL:-http://decision-service:8090/v1/decide}
     depends_on:
       detection-engine:
         condition: service_started
       containment-engine:
+        condition: service_started
+      decision-service:
         condition: service_started
     restart: unless-stopped
 

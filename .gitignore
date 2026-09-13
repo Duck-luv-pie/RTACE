@@ -17,3 +17,6 @@ RESUME_PLAN.md
 
 # Test / tooling caches
 .pytest_cache/
+
+# Go build output
+decision-service/bin/

@@ -17,10 +17,14 @@ Simulator ─► Kafka tx-events   ──┐
                                  │
                                  └─► poison records ──► Kafka rtace-dlq
    Detection + Containment + API ──► Kafka audit-log        Control API ◄──► Redis (list / override rules)
+
+   Payment authoriser ──► Decision service (Go, gRPC/HTTP) ──► Redis (same Lua check, same rules) ──► ALLOW / CHALLENGE / DENY
+                                                    └──► decision:result:{event_id}  (re-emitted by the detection engine as detections)
 ```
 
 - **Redis**: state store (replay keys, user sessions, burst and auth-fail windows, cooldowns) **and** enforcement store (quarantines, step-ups, IP blocks). Runs with `noeviction` + AOF so a rule is never silently dropped.
 - **FastAPI**: control API for health, enforcement rules and manual overrides (token-protected).
+- **Decision service (Go)**: synchronous `Decide` call (gRPC and HTTP/JSON) that answers ALLOW / CHALLENGE / DENY in about a millisecond before a transaction is authorised, using the same Redis state and Lua check as the detection engine.
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
 - **Docker Compose**: runs Kafka (KRaft, no ZooKeeper), Redis, Prometheus and Grafana locally, with persistent volumes; `--profile app` also builds and runs the four Python services.
@@ -135,6 +139,7 @@ Each component exposes Prometheus metrics:
 
 | Component           | Metrics endpoint   | Port |
 |---------------------|--------------------|------|
+| Decision service    | `http://localhost:8090/metrics` | 8090 |
 | Detection engine    | `http://localhost:9091/metrics` | 9091 |
 | Containment engine  | `http://localhost:9094/metrics` | 9094 |
 | Control API         | `http://localhost:8000/metrics` | 8000 |
@@ -153,6 +158,7 @@ Each component exposes Prometheus metrics:
 - `processing_errors_total{stage,kind}` — handler failures (`transient` = retried in place, `permanent` = dead-lettered)
 - `dlq_messages_total{stage}` — records written to `rtace-dlq`
 - `kafka_send_failures_total{topic}` — async producer sends that failed after retries
+- `decisions_total{verdict}`, `decision_reasons_total{type}`, `decision_latency_seconds`, `decision_errors_total` — decision service
 - `containment_actions_total{detection_type,action}` — containment actions executed (`quarantine` \| `step_up_auth` \| `ip_block`)
 - `events_blocked_total{event_type,reason}` — events the detection engine refused because a rule was active (`transaction`/`quarantine`, `auth`/`ip_block`); blocked transactions also appear as `transactions_processed_total{outcome="blocked"}`
 - `redis_operation_latency_seconds{operation}` — Redis round-trip latency per phase (`enforce_batch`, `detect_batch`, `cooldown_batch`, `decision_fetch`, `setex_quarantine`, `ping`, `scan_enforcement`)
@@ -216,6 +222,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
    - **Fraud burst detections (rate)** — `fraud_burst_detections_total`
    - **Credential stuffing detections (rate, by scope)** — `credential_stuffing_detections_total` (`user` vs `ip`)
    - **Events blocked by enforcement**, **Detections suppressed by cooldown**, **Consumer processing errors and DLQ**, **Kafka send failures**
+   - **Synchronous decisions by verdict**, **Decision latency**
 
 6. Ensure the detection engine, containment engine, and (optionally) the simulator and API are running so Prometheus has data; then refresh or wait for the next scrape.
 
@@ -327,6 +334,7 @@ Grafana is included in the Docker Compose stack and is provisioned at startup:
 RTACE/
 ├── simulator/           # Traffic generator with tagged attack scenarios (tx-events, auth-events)
 ├── lua/                 # tx_check.lua, auth_check.lua: the per-event checks, shared by Python and Go
+├── decision-service/    # Go: synchronous Decide (gRPC + HTTP), proto contract, Dockerfile
 ├── detection_engine/    # Batched DetectionPipeline, detector interpreters, cooldown
 ├── containment_engine/  # ContainmentPipeline + policy; detections → Redis rules + audit-log
 ├── api/                 # FastAPI control API (rules, manual overrides, health, metrics)
@@ -338,6 +346,47 @@ RTACE/
 ├── .github/workflows/   # CI: import check + tests on Python 3.11 / 3.12 / 3.13
 └── README.md
 ```
+
+## Synchronous decisions (Go decision service)
+
+The asynchronous pipeline detects fraud after the fact and blocks the user's *next* transaction. The decision service closes that gap: a payment authoriser calls `Decide` with the transaction it is about to approve and gets a verdict in about a millisecond.
+
+```
+decision-service/
+├── proto/rtace/v1/decision.proto   # the contract (gRPC); gen/ holds the generated Go
+├── internal/decision/engine.go     # Redis lookups + lua/tx_check.lua + scoring
+├── internal/decision/server.go     # gRPC server and POST /v1/decide (JSON)
+└── cmd/decision-service/main.go    # :9095 gRPC, :8090 HTTP + /metrics + /healthz
+```
+
+**What a call does** (two Redis round trips, both pipelined):
+
+1. Read enforcement state. Quarantined user → `DENY` (`user_quarantined`); blocked IP → `DENY` (`ip_blocked`); pending step-up → `CHALLENGE` (`step_up_pending`). Nothing is written for these.
+2. Run **the same `lua/tx_check.lua`** the detection engine runs, with delivery ref `decision:{event_id}`. Replay → 100, burst → 80, impossible travel → 70. Score = strongest signal + 10 per extra signal, capped at 100. `≥ DECISION_DENY_SCORE` (80) → `DENY`, `≥ DECISION_CHALLENGE_SCORE` (40) → `CHALLENGE`, else `ALLOW`. So replay and burst deny, geo challenges, mirroring the async containment policy.
+3. Store the decision at `decision:result:{event_id}` (TTL `DECISION_RESULT_TTL_SECONDS`, 24h). A retry with the same `event_id` returns the stored verdict with `cached: true` instead of being scored as a replay.
+
+**How it meets the async path.** When the transaction's Kafka record later reaches the detection engine, the Lua script sees the `decision:` delivery ref, reports `prescored`, and the engine does not advance state again. Instead it fetches the stored decision and re-emits its findings as detections (`details.source = "decision-service"`), so containment and the audit log are identical whether or not the authoriser asked first. The engine counts these as `transactions_processed_total{outcome="prescored"}`.
+
+**Run it**
+
+```bash
+cd decision-service && go build -o bin/decision-service ./cmd/decision-service
+REDIS_ADDR=localhost:6379 ./bin/decision-service         # finds ../lua automatically (or set LUA_DIR)
+
+curl -s -X POST localhost:8090/v1/decide -H 'Content-Type: application/json' -d '{"transaction":{
+  "event_id":"e-1","user_id":"user_1","amount":42.5,"merchant":"Amazon",
+  "timestamp":"2026-09-13T10:00:00+00:00","location":"US-CA","latitude":37.0,"longitude":-122.0}}'
+# -> {"decision_id":"dec-…","verdict":"ALLOW","score":0,"reasons":[],"decided_at":"…"}
+grpcurl -plaintext localhost:9095 list                    # reflection is enabled
+```
+
+With Docker: the `app` profile builds and runs it (`decision-service:8090`), and the simulator is configured with `SIM_DECISION_URL` to ask it before publishing each transaction, exactly as an authoriser would. On the host: `python -m simulator.transaction_simulator --decision-url http://localhost:8090/v1/decide`. Verdict counts appear in the simulator log and on the Grafana **Synchronous decisions** panels.
+
+**Configuration**: same `REDIS_*`, `GEO_MAX_VELOCITY_KMH` variables as the Python services, plus `REDIS_ADDR` (default `localhost:6379`), `GRPC_ADDR` (`:9095`), `HTTP_ADDR` (`:8090`), `LUA_DIR`, `DECISION_RESULT_TTL_SECONDS`, `DECISION_DENY_SCORE`, `DECISION_CHALLENGE_SCORE`.
+
+**Tests**: `cd decision-service && go test ./...` runs against an in-process miniredis executing the real Lua script, and includes a check that Go's replay hash matches Python's byte for byte.
+
+**Why Go for this component**: it has a hard latency budget at high request rates and is new code with a clean Protobuf boundary, so it can be built in Go without rewriting anything that already works. The Lua script is the shared contract for detection semantics.
 
 ## Enforcement and containment policy
 
@@ -382,6 +431,8 @@ Both consumers share one loop (`common/consumer_loop.py`) with these rules:
 
 Each simulated user has a **home city**; nearly all of their transactions come from there, so geo velocity sees realistic traffic. Attacks are injected on top and logged with a `scenario=` tag:
 
+When `--decision-url` / `SIM_DECISION_URL` is set, every transaction is first sent to the decision service and the verdict is logged (`decision=DENY …`), then published as usual.
+
 | Scenario | What is sent | Default schedule | Detector it exercises |
 |----------|--------------|------------------|-----------------------|
 | `replay` | a user's previous transaction, byte-for-byte | 5% of iterations | replay |
@@ -392,7 +443,7 @@ Each simulated user has a **home city**; nearly all of their transactions come f
 
 Quarantined users keep sending, which is what an attacker does, so you also see enforcement working (`Blocked transaction` in the detection engine, `events_blocked_total` in Grafana).
 
-Knobs, as environment variables or flags (flags win): `SIM_INTERVAL_SECONDS` / `--interval` (default 0.5), `SIM_USERS` / `--users` (20), `SIM_REPLAY_PROBABILITY` / `--replay-p`, `SIM_IMPOSSIBLE_TRAVEL_PROBABILITY` / `--travel-p`, `SIM_AUTH_FAIL_PROBABILITY` / `--auth-fail-p`, `SIM_BURST_EVERY` / `--burst-every`, `SIM_STUFFING_USER_EVERY`, `SIM_STUFFING_IP_EVERY` (0 disables a scenario), `SIM_SEED` / `--seed` for a reproducible stream.
+Knobs, as environment variables or flags (flags win): `SIM_INTERVAL_SECONDS` / `--interval` (default 0.5), `SIM_USERS` / `--users` (100), `SIM_REPLAY_PROBABILITY` / `--replay-p`, `SIM_IMPOSSIBLE_TRAVEL_PROBABILITY` / `--travel-p`, `SIM_AUTH_FAIL_PROBABILITY` / `--auth-fail-p`, `SIM_BURST_EVERY` / `--burst-every`, `SIM_STUFFING_USER_EVERY`, `SIM_STUFFING_IP_EVERY` (0 disables a scenario), `SIM_SEED` / `--seed` for a reproducible stream.
 
 ## Event types
 
