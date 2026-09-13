@@ -14,3 +14,6 @@ __pycache__/
 
 # Internal planning notes
 RESUME_PLAN.md
+
+# Test / tooling caches
+.pytest_cache/

@@ -1,7 +1,7 @@
 # RTACE - Real-Time Transaction Anomaly & Containment Engine
 # Python 3.11
 
-kafka-python==2.0.2
+kafka-python==2.3.2
 redis==5.0.1
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
