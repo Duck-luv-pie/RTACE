@@ -193,6 +193,27 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # RTWP ingest gateway: the network front door. Terminates the custom TCP wire
+  # protocol (auth, framing, replay/flood/malformed defence) and forwards valid
+  # events into Kafka. Port 9500 = protocol, 9096 = metrics.
+  gateway:
+    image: rtace:local
+    pull_policy: never  # built by detection-engine above
+    profiles: [app]
+    command: ["python", "-m", "netgw.server"]
+    environment:
+      <<: *app-env
+      RTWP_SECRET: ${RTWP_SECRET:-rtace-dev-secret}
+    ports:
+      - "9500:9500"
+      - "9096:9096"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   simulator:
     image: rtace:local
     pull_policy: never  # built by detection-engine above; never try the registry
@@ -204,12 +225,19 @@ services:
       # Ask the decision service before publishing each transaction, like a
       # payment authoriser would. Unset to publish without asking.
       SIM_DECISION_URL: ${SIM_DECISION_URL:-http://decision-service:8090/v1/decide}
+      # Deliver events over the RTWP wire protocol through the gateway (which
+      # forwards to Kafka), instead of producing to Kafka directly. Unset SIM_GATEWAY
+      # to go straight to Kafka.
+      SIM_GATEWAY: ${SIM_GATEWAY:-gateway:9500}
+      SIM_GATEWAY_SECRET: ${RTWP_SECRET:-rtace-dev-secret}
     depends_on:
       detection-engine:
         condition: service_started
       containment-engine:
         condition: service_started
       decision-service:
+        condition: service_started
+      gateway:
         condition: service_started
     restart: unless-stopped
 

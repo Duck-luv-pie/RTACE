@@ -85,6 +85,8 @@ class SimulatorSettings:
     stuffing_ip_every: int = 400    # iterations between IP-targeted stuffing (0 = never)
     seed: Optional[int] = None
     decision_url: Optional[str] = None  # POST each transaction here first (decision service)
+    gateway: Optional[str] = None       # host:port of the RTWP gateway; if set, events go over TCP
+    gateway_secret: str = "rtace-dev-secret"
 
     @classmethod
     def from_env(cls) -> "SimulatorSettings":
@@ -102,6 +104,8 @@ class SimulatorSettings:
             stuffing_ip_every=int(os.getenv("SIM_STUFFING_IP_EVERY", d.stuffing_ip_every)),
             seed=int(os.environ["SIM_SEED"]) if os.getenv("SIM_SEED") else None,
             decision_url=os.getenv("SIM_DECISION_URL") or None,
+            gateway=os.getenv("SIM_GATEWAY") or None,
+            gateway_secret=os.getenv("SIM_GATEWAY_SECRET", "rtace-dev-secret"),
         )
 
 
@@ -214,6 +218,24 @@ def run_simulator(settings: Optional[SimulatorSettings] = None) -> None:
     settings = settings or SimulatorSettings.from_env()
     config = KafkaConfig.from_env()
     producer = create_producer(config)
+
+    gw_client = None
+    if settings.gateway:
+        from netgw.client import RTWPClient
+        host, _, port = settings.gateway.partition(":")
+        gw_client = RTWPClient(host, int(port or 9500), "simulator", settings.gateway_secret.encode())
+        gw_client.connect()
+        logger.info("Delivering events over RTWP to %s", settings.gateway)
+
+    def deliver(kind, event):
+        """Send one event downstream: over the wire protocol to the gateway if
+        configured (the gateway forwards it to Kafka), otherwise straight to Kafka."""
+        if gw_client is not None:
+            gw_client.send_event_with_retry(kind, event)
+        else:
+            topic = config.tx_events_topic if kind == "tx" else config.auth_events_topic
+            send_message(producer, topic, event, key=event.get("user_id"))
+
     logger.info("Starting simulator → %s + %s with %s", config.tx_events_topic, config.auth_events_topic, settings)
 
     sent = 0
@@ -237,9 +259,9 @@ def run_simulator(settings: Optional[SimulatorSettings] = None) -> None:
                         )
                     if sum(verdicts.values()) % 200 == 0:
                         logger.info("decision verdicts so far: %s", dict(verdicts))
-                send_message(producer, config.tx_events_topic, ev.model_dump(mode="json"), key=ev.user_id)
+                deliver("tx", ev.model_dump(mode="json"))
             else:
-                send_message(producer, config.auth_events_topic, ev.model_dump(mode="json"), key=ev.user_id)
+                deliver("auth", ev.model_dump(mode="json"))
             sent += 1
             if item.scenario != "normal":
                 logger.info(
@@ -271,6 +293,8 @@ def _parse_args(argv=None) -> SimulatorSettings:
     p.add_argument("--stuffing-ip-every", type=int, default=env.stuffing_ip_every, help="0 disables")
     p.add_argument("--seed", type=int, default=env.seed)
     p.add_argument("--decision-url", default=env.decision_url, help="e.g. http://localhost:8090/v1/decide; unset = don't ask")
+    p.add_argument("--gateway", default=env.gateway, help="host:port of the RTWP gateway; if set, events are sent over TCP instead of straight to Kafka")
+    p.add_argument("--gateway-secret", default=env.gateway_secret)
     a = p.parse_args(argv)
     return SimulatorSettings(
         interval_seconds=a.interval,
@@ -283,6 +307,8 @@ def _parse_args(argv=None) -> SimulatorSettings:
         stuffing_ip_every=a.stuffing_ip_every,
         seed=a.seed,
         decision_url=a.decision_url or None,
+        gateway=a.gateway or None,
+        gateway_secret=a.gateway_secret,
     )
 
 

@@ -20,3 +20,4 @@ RESUME_PLAN.md
 
 # Go build output
 decision-service/bin/
+deployment/certs/

@@ -1,6 +1,6 @@
 # RTACE — Real-Time Transaction Anomaly & Containment Engine
 
-A real-time fraud detection pipeline that ingests transaction and login streams, detects replay attacks, impossible travel, transaction bursts and credential stuffing, applies tiered containment, and **enforces** the resulting rules on subsequent traffic.
+A real-time fraud detection pipeline that ingests transaction and login streams **over a custom authenticated TCP wire protocol**, detects replay attacks, impossible travel, transaction bursts and credential stuffing, applies tiered containment, and **enforces** the resulting rules on subsequent traffic. The network gateway and the fraud engine share one Redis IP blocklist, so protocol-layer abuse and application-layer fraud are contained together.
 
 [![CI](https://github.com/Duck-luv-pie/RTACE/actions/workflows/ci.yml/badge.svg)](https://github.com/Duck-luv-pie/RTACE/actions/workflows/ci.yml)
 
@@ -24,6 +24,7 @@ Simulator ─► Kafka tx-events   ──┐
 
 - **Redis**: state store (replay keys, user sessions, burst and auth-fail windows, cooldowns) **and** enforcement store (quarantines, step-ups, IP blocks). Runs with `noeviction` + AOF so a rule is never silently dropped.
 - **FastAPI**: control API for health, enforcement rules and manual overrides (token-protected).
+- **RTWP gateway**: a hand-written binary TCP protocol and asyncio server that is the network front door — authenticated handshake, per-frame integrity, replay/flood/malformed/connection-exhaustion defences — forwarding only valid events into Kafka.
 - **Decision service (Go)**: synchronous `Decide` call (gRPC and HTTP/JSON) that answers ALLOW / CHALLENGE / DENY in about a millisecond before a transaction is authorised, using the same Redis state and Lua check as the detection engine.
 - **Prometheus**: scrapes metrics from the detection engine, containment engine, and API.
 - **Grafana**: pre-provisioned with Prometheus as default data source and an RTACE starter dashboard.
@@ -151,6 +152,7 @@ Each component exposes Prometheus metrics:
 | Component           | Metrics endpoint   | Port |
 |---------------------|--------------------|------|
 | Decision service    | `http://localhost:8090/metrics` | 8090 |
+| RTWP gateway        | `http://localhost:9096/metrics` | 9096 |
 | Detection engine    | `http://localhost:9091/metrics` | 9091 |
 | Containment engine  | `http://localhost:9094/metrics` | 9094 |
 | Control API         | `http://localhost:8000/metrics` | 8000 |
@@ -347,6 +349,7 @@ If you edit `deployment/prometheus.yml` while the stack is running, Prometheus d
 RTACE/
 ├── simulator/           # Traffic generator with tagged attack scenarios (tx-events, auth-events)
 ├── lua/                 # tx_check.lua, auth_check.lua: the per-event checks, shared by Python and Go
+├── netgw/               # RTWP wire protocol, TCP gateway, socket client, attack generator
 ├── decision-service/    # Go: synchronous Decide (gRPC + HTTP), proto contract, Dockerfile
 ├── detection_engine/    # Batched DetectionPipeline, detector interpreters, cooldown
 ├── containment_engine/  # ContainmentPipeline + policy; detections → Redis rules + audit-log
@@ -359,6 +362,88 @@ RTACE/
 ├── .github/workflows/   # CI: import check + tests on Python 3.11 / 3.12 / 3.13
 └── README.md
 ```
+
+## Network ingress: the RTWP wire protocol
+
+Events do not arrive as tidy Kafka records from nowhere — they come off the
+network from clients, and the network is hostile. The **RTWP gateway**
+(`netgw/`) is a hand-written TCP server that terminates a custom binary
+protocol and lets only well-formed, authenticated, fresh events through to
+Kafka.
+
+**The wire format** (`netgw/protocol.py`) is a fixed 58-byte header plus
+payload, big-endian:
+
+```
+magic "RT" | version | type | flags | reserved | payload_len (u32)
+           | seq (u64) | timestamp_ms (u64) | hmac-sha256 (32) | payload
+```
+
+Each field earns its place: the length is hard-capped so a hostile header can't
+force a huge allocation; the HMAC (over the whole header with the hmac field
+zeroed, plus the payload) gives integrity and authentication; the sequence
+number makes a captured frame a replay the second time it's seen; the timestamp
+bounds how long a captured frame is useful at all.
+
+**Handshake** (challenge-response, so the secret never crosses the wire):
+
+```
+client → HELLO(client_id)      server → CHALLENGE(nonce)
+client → AUTH(hmac(secret,nonce))   server → READY
+client → EVENT(json) ...        server → ACK / ERROR
+```
+
+**Defensive controls** (all in `netgw/server.py`):
+
+| Attack | Control |
+|--------|---------|
+| Spoofing / tampering | per-frame HMAC-SHA256, constant-time compare |
+| Replay | monotonic per-connection sequence + timestamp freshness window |
+| Malformed / injection | typed protocol errors, a strike system, bounded reads, no oversized allocation |
+| Flooding / rate abuse | per-connection token bucket |
+| Connection exhaustion / slowloris | global + per-IP connection caps, handshake and idle timeouts |
+| Credential stuffing (protocol) | authenticated handshake; repeated auth failures strike and block the IP |
+| Known-bad sources | refuses IPs in the shared Redis `block:ip:*` blocklist the fraud engine writes |
+
+An abusive IP the gateway blocks lands in the **same** `block:ip:{ip}` keys the
+fraud containment uses, so the two layers defend as one.
+
+**Run it**
+
+```bash
+PYTHONPATH=. python -m netgw.server          # listens on :9500, metrics on :9096
+# point the simulator at it (events now travel over RTWP, not straight to Kafka):
+PYTHONPATH=. python -m simulator.transaction_simulator --gateway 127.0.0.1:9500
+```
+
+**TLS / mTLS** (optional):
+
+```bash
+scripts/gen_certs.sh                          # writes deployment/certs/{ca,server,client}.{crt,key}
+GATEWAY_TLS_ENABLED=true \
+  GATEWAY_TLS_CERTFILE=deployment/certs/server.crt \
+  GATEWAY_TLS_KEYFILE=deployment/certs/server.key \
+  GATEWAY_TLS_CAFILE=deployment/certs/ca.crt \   # set to require client certs (mTLS)
+  PYTHONPATH=. python -m netgw.server
+```
+
+**Attack it** — the adversarial traffic generator exercises every control and
+reports what the gateway did:
+
+```bash
+PYTHONPATH=. python -m netgw.attack --mode all --host 127.0.0.1 --port 9500
+#  • flood: 5 accepted, 100 rate-limited, then connection dropped — flood contained
+#  • replay: first=ACK, resend=ERROR (replay ...) — replay rejected
+#  • tamper: server said ERROR (bad_hmac ...) — integrity enforced
+#  • exhaust: N held, M refused by the per-IP cap — exhaustion contained
+#  • stuff: K auth failures, IP blocked after strikes — auth abuse contained
+```
+
+**Traffic-analysis metrics** on `:9096`: `gw_connections_total{result}`,
+`gw_frames_total{type,result}`, `gw_malformed_total{reason}`,
+`gw_replays_rejected_total`, `gw_rate_limited_total`, `gw_auth_total{result}`,
+`gw_abuse_blocks_total`, `gw_events_forwarded_total{kind}` — the Grafana
+dashboard plots connections-by-outcome and malicious-frames-by-type.
 
 ## Synchronous decisions (Go decision service)
 
